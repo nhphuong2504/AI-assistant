@@ -1,0 +1,13 @@
+pandas
+numpy
+python-dateutil
+
+# Web
+fastapi
+uvicorn
+
+# UI
+streamlit
+
+# Visualization
+plotly
