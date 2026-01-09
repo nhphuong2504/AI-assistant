@@ -11,3 +11,6 @@ streamlit
 
 # Visualization
 plotly
+
+openai
+python-dotenv
