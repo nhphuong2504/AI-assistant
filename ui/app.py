@@ -7,7 +7,7 @@ API_URL = st.sidebar.text_input("API URL", "http://127.0.0.1:8000")
 
 st.title("Retail Data Assistant — SQL Playground")
 
-tab1, tab2, tab3 = st.tabs(["Schema", "SQL Runner", "Ask (Text-to-SQL)"])
+tab1, tab2, tab3, tab4 = st.tabs(["Schema", "SQL Runner", "Ask (Text-to-SQL)", "CLV"])
 
 
 with tab1:
@@ -89,4 +89,29 @@ with tab3:
                     fig = px.line(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
                 else:
                     fig = px.scatter(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
+                st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
+
+    cutoff = st.date_input("Cutoff date (calibration end)", value=pd.to_datetime("2011-09-30"))
+    horizon = st.slider("CLV horizon (days)", 30, 365, 180)
+
+    if st.button("Run CLV"):
+        r = requests.post(
+            f"{API_URL}/clv",
+            json={"cutoff_date": str(cutoff), "horizon_days": int(horizon)},
+            timeout=180,
+        )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.json(payload["summary"])
+
+            df = pd.DataFrame(payload["top_customers"])
+            st.dataframe(df, use_container_width=True)
+
+            if "clv" in df.columns:
+                fig = px.bar(df, x="customer_id", y="clv", title="Top customers by predicted CLV")
                 st.plotly_chart(fig, use_container_width=True)

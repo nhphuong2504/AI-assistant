@@ -14,3 +14,5 @@ plotly
 
 openai
 python-dotenv
+lifetimes
+scipy

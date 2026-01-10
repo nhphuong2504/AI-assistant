@@ -78,3 +78,16 @@ def get_schema() -> Dict[str, Any]:
                 for c in cols
             ]
         return schema
+
+def run_query_internal(sql: str, max_rows: int = 2_000_000):
+    s = sql.strip()
+    if MULTI_STMT.search(s):
+        raise ValueError("Multiple statements are not allowed.")
+    if FORBIDDEN.search(s):
+        raise ValueError("Forbidden keyword detected.")
+    with get_conn() as conn:
+        cur = conn.execute(s)
+        rows = cur.fetchmany(max_rows)
+        cols = [d[0] for d in cur.description] if cur.description else []
+        out = [dict(r) for r in rows]
+        return out, cols
