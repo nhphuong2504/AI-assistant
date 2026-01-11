@@ -16,3 +16,5 @@ openai
 python-dotenv
 lifetimes
 scipy
+lifelines
+
