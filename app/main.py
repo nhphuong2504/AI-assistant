@@ -5,6 +5,17 @@ from app.db import get_schema, run_query, run_query_internal
 from app.llm import generate_sql
 import pandas as pd
 from analytics.clv import build_rfm, fit_models, predict_clv
+from analytics.survival import (
+    build_covariate_table,
+    fit_km_all,
+    CUTOFF_DATE,
+    INACTIVITY_DAYS,
+    build_cox_design,
+    fit_cox,
+    cox_summary_json,
+)
+
+from analytics.survival import km_stratified
 
 
 
@@ -50,6 +61,27 @@ class CLVResponse(BaseModel):
 
 
 
+class KMResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    n_customers: int
+    churn_rate: float
+    survival_curve: List[Dict[str, float]]
+
+class KMStratResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    stratify: str
+    groups: Dict[str, Dict[str, float]]  # {group: {"n":..., "churn_rate":...}}
+    curves: Dict[str, List[Dict[str, float]]]  # {group: curve_points}
+
+class CoxResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    population: str
+    n_customers: int
+    covariates: List[str]
+    summary: List[Dict[str, Any]]
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -151,5 +183,112 @@ def clv(req: CLVRequest) -> CLVResponse:
         cutoff_date=req.cutoff_date,
         horizon_days=req.horizon_days,
         top_customers=top.to_dict(orient="records"),
+        summary=summary,
+    )
+
+
+@app.post("/survival/km", response_model=KMResponse)
+def km_all(inactivity_days: int = INACTIVITY_DAYS) -> KMResponse:
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+    ).df
+
+    kmf = fit_km_all(cov)
+
+    curve = [
+        {"time": float(t), "survival": float(s)}
+        for t, s in zip(kmf.timeline, kmf.survival_function_.iloc[:, 0])
+    ]
+
+    return KMResponse(
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+        n_customers=len(cov),
+        churn_rate=float(cov["event"].mean()),
+        survival_curve=curve,
+    )
+
+@app.post("/survival/km_strat", response_model=KMStratResponse)
+def km_strat(
+    stratify: str,
+    inactivity_days: int = INACTIVITY_DAYS
+) -> KMStratResponse:
+    # allowed stratifications
+    allowed = {"is_uk", "orders_per_month", "aov", "monetary_value"}
+    if stratify not in allowed:
+        raise ValueError(f"stratify must be one of {sorted(allowed)}")
+
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+    ).df
+
+    curves, churn_rates, sizes = km_stratified(cov, stratify=stratify)
+
+    groups = {
+        g: {"n": float(sizes[g]), "churn_rate": float(churn_rates[g])}
+        for g in curves.keys()
+    }
+
+    return KMStratResponse(
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+        stratify=stratify,
+        groups=groups,
+        curves=curves,
+    )
+
+@app.post("/survival/cox", response_model=CoxResponse)
+def cox_model(
+    inactivity_days: int = INACTIVITY_DAYS,
+) -> CoxResponse:
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+    ).df
+
+    df_cox = build_cox_design(cov=cov)
+
+    # Fit Cox
+    cph = fit_cox(df_cox, penalizer=0.1)
+    summary = cox_summary_json(cph)
+
+    population = "all_customers"
+    covariates = [x for x in df_cox.columns if x not in {"duration", "event"}]
+
+    return CoxResponse(
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+        population=population,
+        n_customers=int(len(df_cox)),
+        covariates=covariates,
         summary=summary,
     )

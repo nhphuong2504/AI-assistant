@@ -1,61 +1,299 @@
 import pandas as pd
+import numpy as np
 from dataclasses import dataclass
+from lifelines import KaplanMeierFitter, CoxPHFitter
+from typing import Dict, List, Tuple, Optional
+
+# --------------------
+# GLOBAL MODEL ASSUMPTIONS
+# --------------------
+CUTOFF_DATE = "2011-12-09"
+INACTIVITY_DAYS = 90
+
 
 @dataclass
-class SurvivalData:
+class CovariateTable:
     df: pd.DataFrame
     cutoff_date: pd.Timestamp
-    inactivity_days: int
 
 
-def build_survival_table(
+def build_covariate_table(
     transactions: pd.DataFrame,
-    cutoff_date: str,
-    inactivity_days: int = 90,
-) -> SurvivalData:
+    cutoff_date: str = CUTOFF_DATE,
+    inactivity_days: int = INACTIVITY_DAYS,
+) -> CovariateTable:
+    """
+    Builds a customer-level table at a fixed cutoff date (inclusive),
+    using invoice-level orders.
+
+    Output columns (core):
+      customer_id, duration, event,
+      frequency, recency, tenure_days, gap_days,
+      monetary_value, aov, orders_per_month,
+      product_diversity, is_uk
+    """
     df = transactions.copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
     cutoff = pd.to_datetime(cutoff_date)
 
-    # invoice-level orders
+    # Observation window (inclusive)
+    df = df[df["invoice_date"] <= cutoff]
+    df = df[df["customer_id"].notna()]
+    df = df[df["revenue"] > 0]
+
+    # Invoice-level orders
     orders = (
-        df[df["invoice_date"] <= cutoff]
-        .groupby(["customer_id", "invoice_no"], as_index=False)
-        .agg(order_date=("invoice_date", "min"))
+        df.groupby(["customer_id", "invoice_no"], as_index=False)
+          .agg(
+              order_date=("invoice_date", "min"),
+              order_value=("revenue", "sum"),
+          )
     )
 
     g = orders.groupby("customer_id")
-
     first = g["order_date"].min()
     last = g["order_date"].max()
+    n_orders = g["invoice_no"].nunique()
 
-    # time since last purchase at cutoff
-    gap = (cutoff - last).dt.days
+    # Time quantities (days)
+    tenure_days = (cutoff - first).dt.days
+    recency = (last - first).dt.days
+    gap_days = (cutoff - last).dt.days  # "recent visits" proxy: lower = more recent
 
-    # churn indicator
-    churned = gap >= inactivity_days
+    # Survival event: churn if inactive for >= inactivity_days at cutoff
+    event = (gap_days >= inactivity_days).astype(int)
 
-    # survival duration:
-    # if churned → last_purchase + inactivity_days
-    # else → censored at cutoff
+    # Duration: if churned, event time = last + inactivity_days; else censored at cutoff
     duration = pd.Series(index=first.index, dtype=float)
-    duration[churned] = (last[churned] + pd.to_timedelta(inactivity_days, unit="D") - first[churned]).dt.days
-    duration[~churned] = (cutoff - first[~churned]).dt.days
+    duration[event == 1] = (
+        last[event == 1]
+        + pd.to_timedelta(inactivity_days, unit="D")
+        - first[event == 1]
+    ).dt.days
+    duration[event == 0] = tenure_days[event == 0]
 
-    survival_df = pd.DataFrame({
+    # Behavioral covariates
+    frequency = (n_orders - 1).astype(float)
+
+    monetary_value = g["order_value"].mean()
+    monetary_value = monetary_value.where(n_orders >= 2, np.nan)
+
+    total_revenue = g["order_value"].sum()
+    aov = total_revenue / n_orders
+
+    orders_per_month = n_orders / (tenure_days / 30.0)
+    orders_per_month = orders_per_month.replace([np.inf, -np.inf], np.nan)
+
+    product_diversity = (
+        df.groupby("customer_id")["stock_code"]
+          .nunique()
+          .reindex(first.index)
+          .fillna(0)
+          .astype(float)
+    )
+
+    is_uk = (
+        df.groupby("customer_id")["country"]
+          .apply(lambda x: int((x == "United Kingdom").any()))
+          .reindex(first.index)
+          .fillna(0)
+          .astype(int)
+    )
+
+    cov = pd.DataFrame({
         "customer_id": first.index,
         "duration": duration,
-        "event": churned.astype(int),
-        "first_purchase": first,
-        "last_purchase": last,
-        "gap_days": gap,
+        "event": event.astype(int),
+        "frequency": frequency,
+        "recency": recency.astype(float),
+        "tenure_days": tenure_days.astype(float),
+        "gap_days": gap_days.astype(float),
+        "monetary_value": monetary_value.astype(float),
+        "aov": aov.astype(float),
+        "orders_per_month": orders_per_month.astype(float),
+        "product_diversity": product_diversity,
+        "is_uk": is_uk,
     }).reset_index(drop=True)
 
-    # safety
-    survival_df = survival_df[survival_df["duration"] > 0]
+    # Safety filters
+    cov = cov[
+        (cov["duration"] > 0) &
+        (cov["tenure_days"] > 0) &
+        (cov["gap_days"] >= 0)
+    ].copy()
 
-    return SurvivalData(
-        df=survival_df,
-        cutoff_date=cutoff,
-        inactivity_days=inactivity_days,
+    return CovariateTable(df=cov, cutoff_date=cutoff)
+
+
+def fit_km_all(covariates: pd.DataFrame) -> KaplanMeierFitter:
+    kmf = KaplanMeierFitter()
+    kmf.fit(
+        durations=covariates["duration"],
+        event_observed=covariates["event"],
+        label="All customers",
     )
+    return kmf
+
+def _km_curve(df_group: pd.DataFrame, label: str) -> List[Dict[str, float]]:
+    kmf = KaplanMeierFitter()
+    kmf.fit(
+        durations=df_group["duration"],
+        event_observed=df_group["event"],
+        label=label,
+    )
+    return [
+        {"time": float(t), "survival": float(s)}
+        for t, s in zip(kmf.timeline, kmf.survival_function_.iloc[:, 0])
+    ]
+
+
+def add_tertile_group(df: pd.DataFrame, col: str, new_col: str) -> Tuple[pd.DataFrame, List[str]]:
+    """
+    Adds a low/medium/high group column based on tertiles of `col`.
+    Robust to ties via rank.
+    """
+    x = df[col].copy()
+
+    # Handle missing or infinite values
+    x = x.replace([np.inf, -np.inf], np.nan)
+
+    # If too many NaNs, you'll see fewer rows in stratified plots
+    ok = x.notna()
+    if ok.sum() < 10:
+        df[new_col] = np.nan
+        return df, []
+
+    # Rank to break ties for qcut stability
+    xr = x[ok].rank(method="first")
+
+    # qcut into 3 bins
+    try:
+        bins = pd.qcut(xr, q=3, labels=["low", "medium", "high"])
+    except ValueError:
+        # If qcut fails due to duplicates, drop duplicate edges
+        bins = pd.qcut(xr, q=3, labels=["low", "medium", "high"], duplicates="drop")
+
+    df[new_col] = np.nan
+    df.loc[ok, new_col] = bins.astype(str)
+
+    return df, ["low", "medium", "high"]
+
+
+def km_stratified(
+    cov: pd.DataFrame,
+    stratify: str,
+) -> Tuple[Dict[str, List[Dict[str, float]]], Dict[str, float], Dict[str, int]]:
+    """
+    Returns:
+      curves: {group_name: [{"time":..., "survival":...}, ...]}
+      churn_rates: {group_name: churn_rate}
+      sizes: {group_name: n_customers}
+    """
+    df = cov.copy()
+
+    if stratify == "is_uk":
+        df["group"] = df["is_uk"].map({1: "UK", 0: "Non-UK"}).astype(str)
+
+        group_order = ["UK", "Non-UK"]
+
+    elif stratify == "orders_per_month":
+        df, group_order = add_tertile_group(df, "orders_per_month", "group")
+
+    elif stratify == "aov":
+        df, group_order = add_tertile_group(df, "aov", "group")
+
+    elif stratify == "monetary_value":
+        # monetary_value is NaN for one-time buyers by construction.
+        # We'll stratify repeat-buyers only (otherwise the bins are meaningless).
+        df = df[df["monetary_value"].notna()].copy()
+        df, group_order = add_tertile_group(df, "monetary_value", "group")
+
+    else:
+        raise ValueError(f"Unknown stratify='{stratify}'")
+
+    # Drop rows where grouping failed
+    df = df[df["group"].notna()].copy()
+
+    curves: Dict[str, List[Dict[str, float]]] = {}
+    churn_rates: Dict[str, float] = {}
+    sizes: Dict[str, int] = {}
+
+    # If group_order empty (e.g., too many NaNs), fallback to whatever exists
+    if not group_order:
+        group_order = sorted(df["group"].unique().tolist())
+
+    for gname in group_order:
+        gdf = df[df["group"] == gname]
+        if len(gdf) < 20:
+            # skip tiny groups
+            continue
+        curves[gname] = _km_curve(gdf, gname)
+        churn_rates[gname] = float(gdf["event"].mean())
+        sizes[gname] = int(len(gdf))
+
+    return curves, churn_rates, sizes
+
+# --------------------
+# Cox model helpers
+# --------------------
+def _zscore(s: pd.Series) -> pd.Series:
+    mu = s.mean()
+    sd = s.std(ddof=0)
+    if sd == 0 or np.isnan(sd):
+        return s * 0.0
+    return (s - mu) / sd
+
+
+def build_cox_design(
+    cov: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Builds a Cox-ready dataframe with transforms and standardization.
+
+    Covariates included:
+      z_gap_days
+      z_orders_per_month (log1p, z)
+      z_tenure_days
+      z_product_diversity (log1p, z)
+    """
+    df = cov.copy()
+
+    # Log transforms for heavy-tailed covariates
+    df["log_orders_per_month"] = np.log1p(df["orders_per_month"].clip(lower=0))
+    df["log_product_diversity"] = np.log1p(df["product_diversity"].clip(lower=0))
+
+    # Standardize continuous covariates
+    df["z_orders_per_month"] = _zscore(df["log_orders_per_month"])
+    df["z_tenure_days"] = _zscore(df["tenure_days"])
+    df["z_gap_days"] = _zscore(df["gap_days"])
+    df["z_product_diversity"] = _zscore(df["log_product_diversity"])
+
+    cols = [
+        "duration",
+        "event",
+        "z_gap_days",
+        "z_orders_per_month",
+        "z_tenure_days",
+        "z_product_diversity",
+    ]
+
+    out = df[cols].dropna().copy()
+    return out
+
+
+def fit_cox(df_cox: pd.DataFrame, penalizer: float = 0.1) -> CoxPHFitter:
+    cph = CoxPHFitter(penalizer=penalizer)
+    cph.fit(df_cox, duration_col="duration", event_col="event")
+    return cph
+
+
+
+def cox_summary_json(cph: CoxPHFitter) -> List[Dict[str, float]]:
+    """
+    Returns hazard ratios and stats in a JSON-friendly format.
+    """
+    s = cph.summary.reset_index().rename(columns={"index": "covariate"})
+    s["hazard_ratio"] = np.exp(s["coef"])
+    keep = ["covariate", "coef", "hazard_ratio", "se(coef)", "p", "coef lower 95%", "coef upper 95%"]
+    s = s[keep]
+    return s.to_dict(orient="records")

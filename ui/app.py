@@ -7,7 +7,9 @@ API_URL = st.sidebar.text_input("API URL", "http://127.0.0.1:8000")
 
 st.title("Retail Data Assistant — SQL Playground")
 
-tab1, tab2, tab3, tab4 = st.tabs(["Schema", "SQL Runner", "Ask (Text-to-SQL)", "CLV"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Schema", "SQL", "Ask", "CLV", "Survival"]
+)
 
 
 with tab1:
@@ -115,3 +117,110 @@ with tab4:
             if "clv" in df.columns:
                 fig = px.bar(df, x="customer_id", y="clv", title="Top customers by predicted CLV")
                 st.plotly_chart(fig, use_container_width=True)
+
+with tab5:
+    st.subheader("Survival Analysis")
+    st.caption("Cutoff date is fixed at 2011-12-09 (inclusive).")
+
+    st.markdown("## Kaplan–Meier (All customers)")
+
+    inactivity_all = st.slider("Inactivity days → churn (All customers)", 30, 180, 90, step=10)
+
+    if st.button("Run KM (All customers)"):
+        r = requests.post(
+            f"{API_URL}/survival/km?inactivity_days={inactivity_all}",
+            timeout=180,
+        )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+            st.write(f"N customers: {payload['n_customers']} | Churn rate: {payload['churn_rate']:.3f}")
+
+            # Build a plotting dataframe
+            plot_df = pd.DataFrame(payload["survival_curve"])
+
+            fig = px.line(
+                plot_df,
+                x="time",
+                y="survival",
+                title="Kaplan–Meier Survival Curve (All customers)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("## Kaplan–Meier (Stratified)")
+
+    inactivity = st.slider("Inactivity days → churn (Stratified)", 30, 180, 90, step=10)
+
+    strat = st.selectbox(
+        "Stratify KM curves by",
+        options=[
+            ("is_uk", "UK vs Non-UK"),
+            ("orders_per_month", "Orders per month (low/medium/high)"),
+            ("aov", "Average order value (low/medium/high)"),
+            ("monetary_value", "Monetary value (repeat buyers only; low/medium/high)"),
+        ],
+        format_func=lambda x: x[1],
+    )[0]
+
+    if st.button("Run stratified KM"):
+        r = requests.post(
+            f"{API_URL}/survival/km_strat?stratify={strat}&inactivity_days={inactivity}",
+            timeout=180,
+        )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+
+            # Show group stats
+            st.markdown("### Group sizes & churn rates")
+            grp_df = pd.DataFrame([
+                {"group": g, "n": int(info["n"]), "churn_rate": info["churn_rate"]}
+                for g, info in payload["groups"].items()
+            ]).sort_values("group")
+            st.dataframe(grp_df, use_container_width=True)
+
+            # Build a plotting dataframe
+            plot_rows = []
+            for g, curve in payload["curves"].items():
+                for pt in curve:
+                    plot_rows.append({"group": g, "time": pt["time"], "survival": pt["survival"]})
+            plot_df = pd.DataFrame(plot_rows)
+
+            fig = px.line(
+                plot_df,
+                x="time",
+                y="survival",
+                color="group",
+                title="Kaplan–Meier Survival Curves (Stratified)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("## Cox Proportional Hazards")
+
+    inactivity_cox = st.slider("Inactivity days → churn (Cox)", 30, 180, 90, step=10)
+
+    if st.button("Run Cox"):
+        r = requests.post(
+            f"{API_URL}/survival/cox?inactivity_days={inactivity_cox}",
+            timeout=180,
+        )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Population: {payload['population']}")
+            st.write(f"N customers: {payload['n_customers']}")
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+
+            df_sum = pd.DataFrame(payload["summary"])
+            # Make it readable
+            df_sum = df_sum.sort_values("p")
+            st.dataframe(df_sum, use_container_width=True)
+
