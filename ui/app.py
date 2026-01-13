@@ -224,3 +224,135 @@ with tab5:
             df_sum = df_sum.sort_values("p")
             st.dataframe(df_sum, use_container_width=True)
 
+    st.markdown("---")
+    st.markdown("## Per-Customer Conditional Churn Probabilities")
+    st.caption("Forward-looking probabilities: P(churn within H days | alive at cutoff)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        inactivity_churn = st.slider("Inactivity days → churn (Churn Prob)", 30, 180, 90, step=10)
+    with col2:
+        horizon_days = st.number_input(
+            "Prediction horizon (days)",
+            min_value=1,
+            max_value=3650,
+            value=30,
+            step=1,
+            help="Number of days from cutoff to predict churn probability"
+        )
+
+    if st.button("Compute Churn Probabilities"):
+        r = requests.post(
+            f"{API_URL}/survival/churn_prob?inactivity_days={inactivity_churn}&horizon_days={int(horizon_days)}",
+            timeout=180,
+        )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+            st.write(f"N customers (alive at cutoff): {payload['n_customers']}")
+
+            df = pd.DataFrame(payload["customers"])
+            
+            # Get the dynamic churn probability column name
+            churn_col = f"churn_prob_cond_{int(horizon_days)}d"
+            
+            # Filtering and sorting options
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                min_churn_prob = st.slider(
+                    f"Min {int(horizon_days)}-day conditional churn probability",
+                    0.0, 1.0, 0.0, 0.01,
+                    help=f"Filter customers by minimum {int(horizon_days)}-day conditional churn probability"
+                )
+            with col2:
+                max_customers = st.slider(
+                    "Max customers to display",
+                    10, 1000, 100, 10
+                )
+            with col3:
+                sort_by = st.selectbox(
+                    "Sort by",
+                    options=["hazard_score", churn_col],
+                    index=0,
+                    help="hazard_score: continuous risk ranking (partial hazard). Higher = higher risk."
+                )
+            
+            # Apply filter
+            df_filtered = df[df[churn_col] >= min_churn_prob].copy()
+            
+            # Sort by selected column
+            df_filtered = df_filtered.sort_values(sort_by, ascending=False).head(max_customers)
+            
+            st.markdown("### Customer Conditional Churn Probabilities")
+            st.caption("hazard_score: Partial hazard for continuous risk ranking. Higher values indicate higher churn risk.")
+            
+            # Build format dict dynamically
+            format_dict = {
+                "hazard_score": "{:.3f}",
+                churn_col: "{:.3f}",
+                "orders_per_month": "{:.2f}",
+                "aov": "{:.2f}",
+                "tenure_days": "{:.0f}",
+                "gap_days": "{:.0f}",
+            }
+            
+            st.dataframe(
+                df_filtered.style.format(format_dict),
+                use_container_width=True,
+                height=400
+            )
+            
+            if len(df_filtered) > 0:
+                st.markdown("### Hazard Score Distribution")
+                fig_hazard = px.histogram(
+                    df_filtered,
+                    x="hazard_score",
+                    nbins=30,
+                    title="Hazard Score (Partial Hazard) Distribution",
+                    labels={"hazard_score": "Hazard Score (Partial Hazard)", "count": "Count"}
+                )
+                st.plotly_chart(fig_hazard, use_container_width=True)
+                
+                st.markdown(f"### {int(horizon_days)}-Day Conditional Churn Probability Distribution")
+                fig_churn = px.histogram(
+                    df_filtered,
+                    x=churn_col,
+                    nbins=30,
+                    title=f"{int(horizon_days)}-Day Conditional Churn Probability Distribution",
+                    labels={churn_col: f"{int(horizon_days)}-Day Conditional Churn Probability", "count": "Count"}
+                )
+                st.plotly_chart(fig_churn, use_container_width=True)
+                
+                st.markdown("### Churn Risk vs Customer Attributes")
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    x_attr = st.selectbox(
+                        "X axis (customer attribute)",
+                        options=["gap_days", "tenure_days", "orders_per_month", "aov"],
+                        index=0
+                    )
+                
+                with col2:
+                    y_metric = st.selectbox(
+                        "Y axis (risk metric)",
+                        options=["hazard_score", churn_col],
+                        index=0
+                    )
+                
+                y_label = f"{int(horizon_days)}-Day Conditional Churn Probability" if y_metric == churn_col else "Hazard Score (Partial Hazard)"
+                fig_scatter = px.scatter(
+                    df_filtered,
+                    x=x_attr,
+                    y=y_metric,
+                    hover_data=["customer_id"],
+                    title=f"{y_label} vs {x_attr.replace('_', ' ').title()}",
+                    labels={
+                        y_metric: y_label,
+                        x_attr: x_attr.replace("_", " ").title()
+                    }
+                )
+                st.plotly_chart(fig_scatter, use_container_width=True)
+

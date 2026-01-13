@@ -297,3 +297,130 @@ def cox_summary_json(cph: CoxPHFitter) -> List[Dict[str, float]]:
     keep = ["covariate", "coef", "hazard_ratio", "se(coef)", "p", "coef lower 95%", "coef upper 95%"]
     s = s[keep]
     return s.to_dict(orient="records")
+
+
+def predict_churn_probabilities(
+    cov: pd.DataFrame,
+    cph: CoxPHFitter,
+    horizon_days: int,
+    include_churned: bool = False,
+) -> pd.DataFrame:
+    """
+    Predicts per-customer conditional churn probability at a specified horizon using a fitted Cox model.
+    
+    Computes forward-looking, conditional churn probability from the cutoff date:
+    P(churn within H | alive at cutoff) = 1 - S(t₀ + H) / S(t₀)
+    
+    where t₀ = tenure_days (time from first order to cutoff).
+    
+    Args:
+        cov: Covariate table with customer_id, tenure_days, event, and all required covariates
+        cph: Fitted CoxPHFitter model
+        horizon_days: Prediction horizon in days from cutoff (e.g., 30, 60, 90)
+        include_churned: If False, exclude customers already churned at cutoff (event == 1)
+    
+    Returns:
+        DataFrame with columns: customer_id, hazard_score, churn_prob_cond_{horizon_days}d
+        - hazard_score: Partial hazard (linear predictor) for continuous risk ranking (higher = higher risk)
+        - churn_prob_cond_{horizon_days}d: Conditional churn probability at specified horizon
+        Probabilities are conditional on being alive at cutoff.
+    """
+    # Filter out already-churned customers unless explicitly requested
+    if not include_churned:
+        cov = cov[cov["event"] == 0].copy()
+    
+    # Build Cox design matrix for remaining customers
+    df_cox = build_cox_design(cov)
+    
+    # Get covariates (exclude duration and event)
+    covariate_cols = [c for c in df_cox.columns if c not in ["duration", "event"]]
+    
+    # Merge customer_id and tenure_days back into df_cox for proper mapping
+    # The index of df_cox should match cov index (after dropna in build_cox_design)
+    df_cox_with_meta = df_cox.copy()
+    df_cox_with_meta["customer_id"] = cov.loc[df_cox.index, "customer_id"].values
+    df_cox_with_meta["tenure_days"] = cov.loc[df_cox.index, "tenure_days"].values
+    
+    # Prepare customer covariates DataFrame (without duration/event for prediction)
+    customer_covariates = df_cox[covariate_cols].copy()
+    
+    # Predict partial hazard (linear predictor) for continuous ranking
+    # Higher partial hazard = higher risk
+    partial_hazards = cph.predict_partial_hazard(customer_covariates)
+    
+    # Predict survival functions for all customers at once
+    # This returns a DataFrame where each column is a customer's survival function over time
+    # The survival function S(t) gives probability of surviving from time 0 (first order) to time t
+    survival_functions = cph.predict_survival_function(customer_covariates)
+    
+    # Get time index (same for all customers)
+    times = survival_functions.index.values
+    time_min = times.min()
+    time_max = times.max()
+    
+    # Get all customer metadata as arrays for vectorized operations
+    customer_ids = df_cox_with_meta.loc[customer_covariates.index, "customer_id"].values
+    t0_array = df_cox_with_meta.loc[customer_covariates.index, "tenure_days"].values.astype(float)
+    hazard_scores = partial_hazards.values.flatten()
+    
+    # Convert survival functions to numpy array for vectorized interpolation
+    # Shape: (n_times, n_customers)
+    survival_array = survival_functions.values
+    
+    # Vectorized interpolation for S(t₀) for all customers at once
+    # Clip t0 values to valid range for interpolation
+    t0_clipped = np.clip(t0_array, time_min, time_max)
+    # Use np.interp for vectorized 1D interpolation
+    # For each customer, interpolate their survival function at their t0
+    # This is vectorized across customers using list comprehension (necessary because each customer has different t0)
+    s_t0_array = np.array([
+        np.interp(t0_clipped[i], times, survival_array[:, i])
+        for i in range(len(customer_ids))
+    ])
+    
+    # Handle edge case: if t0 exceeds max time, use last survival value
+    s_t0_array = np.where(t0_array > time_max, survival_array[-1, :], s_t0_array)
+    
+    # Handle edge case: if S(t₀) is very small or zero, mark for special handling
+    very_small_s_t0 = s_t0_array < 1e-10
+    
+    # Compute t₀ + H for all customers (single horizon)
+    t_target_array = t0_array + horizon_days
+    t_target_clipped = np.clip(t_target_array, time_min, time_max)
+    
+    # Vectorized interpolation for S(t₀ + H) for all customers
+    # This is vectorized across customers using list comprehension (necessary because each customer has different t_target)
+    s_t_target_array = np.array([
+        np.interp(t_target_clipped[i], times, survival_array[:, i])
+        for i in range(len(customer_ids))
+    ])
+    
+    # Handle edge case: if t_target exceeds max time, use last survival value
+    s_t_target_array = np.where(t_target_array > time_max, survival_array[-1, :], s_t_target_array)
+    
+    # Compute conditional survival: S(t₀ + H) / S(t₀)
+    # Avoid division by zero
+    conditional_survival = np.divide(
+        s_t_target_array,
+        s_t0_array,
+        out=np.zeros_like(s_t_target_array),
+        where=(s_t0_array > 1e-10)
+    )
+    
+    # Clamp to [0, 1] for numerical stability
+    conditional_survival = np.clip(conditional_survival, 0.0, 1.0)
+    
+    # Conditional churn probability: P(churn within H | alive at cutoff) = 1 - S(t₀ + H) / S(t₀)
+    churn_prob_array = 1.0 - conditional_survival
+    
+    # For customers with very small S(t₀), set churn probability to 1.0
+    churn_prob_array[very_small_s_t0] = 1.0
+    
+    # Build results DataFrame
+    results_dict = {
+        "customer_id": customer_ids,
+        "hazard_score": hazard_scores,
+        f"churn_prob_cond_{horizon_days}d": churn_prob_array,
+    }
+    
+    return pd.DataFrame(results_dict)

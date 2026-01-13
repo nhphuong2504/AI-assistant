@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
@@ -13,6 +13,7 @@ from analytics.survival import (
     build_cox_design,
     fit_cox,
     cox_summary_json,
+    predict_churn_probabilities,
 )
 
 from analytics.survival import km_stratified
@@ -82,6 +83,12 @@ class CoxResponse(BaseModel):
     n_customers: int
     covariates: List[str]
     summary: List[Dict[str, Any]]
+
+class ChurnProbResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    n_customers: int
+    customers: List[Dict[str, Any]]  # List of customer churn probabilities
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -188,7 +195,7 @@ def clv(req: CLVRequest) -> CLVResponse:
 
 
 @app.post("/survival/km", response_model=KMResponse)
-def km_all(inactivity_days: int = INACTIVITY_DAYS) -> KMResponse:
+def km_all(inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition")) -> KMResponse:
     sql = """
     SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
     FROM transactions
@@ -220,8 +227,8 @@ def km_all(inactivity_days: int = INACTIVITY_DAYS) -> KMResponse:
 
 @app.post("/survival/km_strat", response_model=KMStratResponse)
 def km_strat(
-    stratify: str,
-    inactivity_days: int = INACTIVITY_DAYS
+    stratify: str = Query(..., description="Stratification variable"),
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition")
 ) -> KMStratResponse:
     # allowed stratifications
     allowed = {"is_uk", "orders_per_month", "aov", "monetary_value"}
@@ -259,7 +266,7 @@ def km_strat(
 
 @app.post("/survival/cox", response_model=CoxResponse)
 def cox_model(
-    inactivity_days: int = INACTIVITY_DAYS,
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
 ) -> CoxResponse:
     sql = """
     SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
@@ -291,4 +298,60 @@ def cox_model(
         n_customers=int(len(df_cox)),
         covariates=covariates,
         summary=summary,
+    )
+
+@app.post("/survival/churn_prob", response_model=ChurnProbResponse)
+def churn_probabilities(
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    horizon_days: int = Query(30, ge=1, le=3650, description="Prediction horizon in days from cutoff"),
+) -> ChurnProbResponse:
+    """
+    Compute per-customer conditional churn probability at a specified horizon using Cox model.
+    
+    Returns forward-looking, conditional churn probability:
+    P(churn within H | alive at cutoff) = 1 - S(t₀ + H) / S(t₀)
+    
+    Customers already churned at cutoff are excluded by default.
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+    ).df
+
+    df_cox = build_cox_design(cov=cov)
+
+    # Fit Cox model
+    cph = fit_cox(df_cox, penalizer=0.1)
+    
+    # Predict conditional churn probability for alive customers only
+    churn_pred = predict_churn_probabilities(
+        cov=cov,
+        cph=cph,
+        horizon_days=horizon_days,
+        include_churned=False,  # Exclude already-churned customers
+    )
+    
+    # Merge with some customer attributes for context
+    # Only merge with customers that are in churn_pred (alive customers)
+    customer_info = cov[["customer_id", "tenure_days", "orders_per_month", "aov", "gap_days"]].copy()
+    result_df = churn_pred.merge(customer_info, on="customer_id", how="left")
+    
+    # Sort by conditional churn probability (highest risk first)
+    churn_col = f"churn_prob_cond_{horizon_days}d"
+    result_df = result_df.sort_values(churn_col, ascending=False)
+
+    return ChurnProbResponse(
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+        n_customers=int(len(result_df)),
+        customers=result_df.to_dict(orient="records"),
     )
