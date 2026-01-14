@@ -120,15 +120,13 @@ with tab4:
 
 with tab5:
     st.subheader("Survival Analysis")
-    st.caption("Cutoff date is fixed at 2011-12-09 (inclusive).")
+    st.caption("Cutoff date is fixed at 2011-12-09 (inclusive). Inactivity days is fixed at 90 days.")
 
     st.markdown("## Kaplan–Meier (All customers)")
 
-    inactivity_all = st.slider("Inactivity days → churn (All customers)", 30, 180, 90, step=10)
-
     if st.button("Run KM (All customers)"):
         r = requests.post(
-            f"{API_URL}/survival/km?inactivity_days={inactivity_all}",
+            f"{API_URL}/survival/km?inactivity_days=90",
             timeout=180,
         )
         if r.status_code != 200:
@@ -152,8 +150,6 @@ with tab5:
     st.markdown("---")
     st.markdown("## Kaplan–Meier (Stratified)")
 
-    inactivity = st.slider("Inactivity days → churn (Stratified)", 30, 180, 90, step=10)
-
     strat = st.selectbox(
         "Stratify KM curves by",
         options=[
@@ -167,7 +163,7 @@ with tab5:
 
     if st.button("Run stratified KM"):
         r = requests.post(
-            f"{API_URL}/survival/km_strat?stratify={strat}&inactivity_days={inactivity}",
+            f"{API_URL}/survival/km_strat?stratify={strat}&inactivity_days=90",
             timeout=180,
         )
         if r.status_code != 200:
@@ -204,11 +200,9 @@ with tab5:
     st.markdown("---")
     st.markdown("## Cox Proportional Hazards")
 
-    inactivity_cox = st.slider("Inactivity days → churn (Cox)", 30, 180, 90, step=10)
-
     if st.button("Run Cox"):
         r = requests.post(
-            f"{API_URL}/survival/cox?inactivity_days={inactivity_cox}",
+            f"{API_URL}/survival/cox?inactivity_days=90",
             timeout=180,
         )
         if r.status_code != 200:
@@ -228,18 +222,14 @@ with tab5:
     st.markdown("## Per-Customer Conditional Churn Probabilities")
     st.caption("Forward-looking probabilities: P(churn within H days | alive at cutoff)")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        inactivity_churn = st.slider("Inactivity days → churn (Churn Prob)", 30, 180, 90, step=10)
-    with col2:
-        horizon_days = st.number_input(
-            "Prediction horizon (days)",
-            min_value=1,
-            max_value=3650,
-            value=30,
-            step=1,
-            help="Number of days from cutoff to predict churn probability"
-        )
+    horizon_days = st.number_input(
+        "Prediction horizon (days)",
+        min_value=1,
+        max_value=3650,
+        value=30,
+        step=1,
+        help="Number of days from cutoff to predict churn probability"
+    )
     
     # Fixed segmentation thresholds (not user-configurable)
     prob_threshold_red = 0.7
@@ -247,7 +237,7 @@ with tab5:
 
     if st.button("Compute Churn Probabilities"):
         r = requests.post(
-            f"{API_URL}/survival/churn_prob?inactivity_days={inactivity_churn}&horizon_days={int(horizon_days)}&prob_threshold_red={prob_threshold_red}&prob_threshold_amber_low={prob_threshold_amber_low}",
+            f"{API_URL}/survival/churn_prob?inactivity_days=90&horizon_days={int(horizon_days)}&prob_threshold_red={prob_threshold_red}&prob_threshold_amber_low={prob_threshold_amber_low}",
             timeout=180,
         )
         if r.status_code != 200:
@@ -418,4 +408,71 @@ with tab5:
                 color_discrete_map={"Red": "#ff6666", "Amber": "#ffcc66", "Green": "#66cc66"}
             )
             st.plotly_chart(fig_scatter, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("## Customer Survival Curve Lookup")
+    st.caption("Look up the conditional survival curve and expected remaining lifetime for a specific customer by ID")
+    st.caption("Conditional survival: S(t₀+u)/S(t₀) where u is time from cutoff (conditional on being alive at cutoff)")
+
+    lookup_customer_id = st.text_input(
+        "Customer ID",
+        value="",
+        help="Enter customer ID to look up survival curve"
+    )
+
+    if st.button("Look Up Customer"):
+        if not lookup_customer_id:
+            st.error("Please enter a customer ID")
+        else:
+            r = requests.get(
+                f"{API_URL}/survival/customer/{lookup_customer_id}?inactivity_days=90",
+                timeout=180,
+            )
+            if r.status_code != 200:
+                st.error(r.text)
+            else:
+                payload = r.json()
+                
+                if not payload["found"]:
+                    st.error(f"Customer {lookup_customer_id}: {payload.get('error', 'Not found')}")
+                else:
+                    st.success(f"Customer {lookup_customer_id} found")
+                    st.write(f"**Tenure at cutoff:** {payload['tenure_days']:.0f} days")
+                    st.write(f"**Expected remaining lifetime:** {payload['expected_remaining_lifetime']:.1f} days ({payload['expected_remaining_lifetime']/30:.1f} months)")
+                    
+                    # Plot survival curve
+                    if payload["survival_curve"]:
+                        curve_df = pd.DataFrame(payload["survival_curve"])
+                        
+                        fig = px.line(
+                            curve_df,
+                            x="time",
+                            y="survival",
+                            title=f"Conditional Survival Curve for Customer {lookup_customer_id} (from cutoff onwards)",
+                            labels={
+                                "time": "Days from cutoff (u)",
+                                "survival": "Conditional Survival Probability S(t₀+u)/S(t₀)"
+                            },
+                            markers=True
+                        )
+                        fig.add_hline(
+                            y=0.5,
+                            line_dash="dash",
+                            line_color="gray",
+                            annotation_text="50% survival",
+                            annotation_position="right"
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        
+                        # Show survival curve data
+                        st.markdown("### Conditional Survival Curve Data")
+                        st.caption("Time: days from cutoff (u). Survival: conditional probability S(t₀+u)/S(t₀)")
+                        st.dataframe(
+                            curve_df.style.format({
+                                "time": "{:.0f}",
+                                "survival": "{:.4f}"
+                            }),
+                            use_container_width=True,
+                            height=300
+                        )
 

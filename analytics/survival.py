@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 from dataclasses import dataclass
 from lifelines import KaplanMeierFitter, CoxPHFitter
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 # --------------------
 # GLOBAL MODEL ASSUMPTIONS
@@ -454,3 +454,152 @@ def predict_churn_probabilities(
     }
     
     return pd.DataFrame(results_dict)
+
+
+def get_customer_survival_curve(
+    cov: pd.DataFrame,
+    cph: CoxPHFitter,
+    customer_id: str,
+    include_churned: bool = False,
+) -> Dict[str, Any]:
+    """
+    Gets the conditional survival curve and expected remaining lifetime for a specific customer.
+    
+    Computes conditional survival from cutoff: S(t0+u)/S(t0) where u is time from cutoff.
+    Uses build_cox_design to retrieve customer covariates, ensuring exact same scaling as
+    predict_churn_probabilities.
+    
+    Args:
+        cov: Covariate table with customer_id, tenure_days, event, and all required covariates
+        cph: Fitted CoxPHFitter model
+        customer_id: Customer ID to look up
+        include_churned: If False, exclude already-churned customers
+    
+    Returns:
+        Dictionary with:
+        - customer_id: Customer ID
+        - found: Whether customer was found
+        - tenure_days: Time from first order to cutoff
+        - survival_curve: List of {time, conditional_survival} points (conditional on being alive at cutoff)
+        - expected_remaining_lifetime: Expected remaining lifetime in days (area under conditional survival curve)
+        - error: Error message if customer not found or already churned
+    """
+    # Convert customer_id to string for comparison
+    customer_id_str = str(customer_id)
+    cov_customer_id = cov["customer_id"].astype(str)
+    
+    # Filter out already-churned customers unless explicitly requested (same as predict_churn_probabilities)
+    if not include_churned:
+        cov = cov[cov["event"] == 0].copy()
+    
+    # Find customer in covariate table
+    customer_row = cov[cov_customer_id == customer_id_str]
+    
+    if len(customer_row) == 0:
+        return {
+            "customer_id": customer_id_str,
+            "found": False,
+            "error": "Customer not found or already churned at cutoff",
+        }
+    
+    customer_row = customer_row.iloc[0]
+    t0 = float(customer_row["tenure_days"])
+    
+    # Build Cox design matrix exactly like predict_churn_probabilities
+    # This ensures we use the same scaling and same customers
+    df_cox = build_cox_design(cov)
+    
+    if len(df_cox) == 0:
+        return {
+            "customer_id": customer_id_str,
+            "found": False,
+            "error": "Unable to build Cox design matrix",
+        }
+    
+    # Find customer in Cox design matrix (after dropna in build_cox_design)
+    customer_idx = customer_row.name
+    if customer_idx not in df_cox.index:
+        return {
+            "customer_id": customer_id_str,
+            "found": False,
+            "error": "Customer covariates missing or invalid (dropped in build_cox_design)",
+        }
+    
+    # Get covariates (exclude duration and event) - exactly like predict_churn_probabilities
+    covariate_cols = [c for c in df_cox.columns if c not in ["duration", "event"]]
+    
+    # Extract this customer's covariates from the Cox design matrix
+    # This ensures exact same scaling as used in predict_churn_probabilities
+    customer_covariates = df_cox.loc[[customer_idx], covariate_cols].copy()
+    
+    # Predict survival function for this customer
+    survival_function = cph.predict_survival_function(customer_covariates)
+    
+    # Get the survival function (first and only column)
+    survival_fn = survival_function.iloc[:, 0]
+    times = survival_fn.index.values
+    
+    # Get S(t0) - survival probability at cutoff
+    # Use np.interp for consistency with predict_churn_probabilities
+    time_min = times.min()
+    time_max = times.max()
+    t0_clipped = np.clip(t0, time_min, time_max)
+    s_t0 = float(np.interp(t0_clipped, times, survival_fn.values))
+    if t0 > time_max:
+        s_t0 = float(survival_fn.iloc[-1])
+    
+    # Handle edge case: if S(t0) is very small or zero
+    if s_t0 < 1e-10:
+        return {
+            "customer_id": customer_id_str,
+            "found": True,
+            "tenure_days": t0,
+            "survival_curve": [{"time": 0.0, "survival": 0.0}],
+            "expected_remaining_lifetime": 0.0,
+        }
+    
+    # Extract survival curve from t0 onwards and convert to conditional
+    # Find times >= t0
+    mask = times >= t0
+    times_from_t0 = times[mask]
+    survival_from_t0 = survival_fn.values[mask]
+    
+    # If no times >= t0, extend with last value
+    if len(times_from_t0) == 0:
+        times_from_t0 = np.array([t0])
+        survival_from_t0 = np.array([s_t0])
+    
+    # Convert to conditional survival: S(t0+u)/S(t0) where u is time from cutoff
+    conditional_survival = survival_from_t0 / s_t0
+    conditional_survival = np.clip(conditional_survival, 0.0, 1.0)
+    
+    # Build conditional survival curve points (time relative to cutoff)
+    survival_curve = [
+        {"time": float(t - t0), "survival": float(s)}
+        for t, s in zip(times_from_t0, conditional_survival)
+    ]
+    
+    # Calculate expected remaining lifetime from conditional survival curve
+    # This is the area under the conditional survival curve
+    if len(times_from_t0) > 1:
+        # Time differences (u values, time from cutoff)
+        u_values = times_from_t0 - t0
+        du = np.diff(u_values)
+        # Average conditional survival probabilities
+        avg_conditional = (conditional_survival[:-1] + conditional_survival[1:]) / 2
+        # Area under curve (trapezoidal rule)
+        expected_remaining_lifetime = float(np.sum(du * avg_conditional))
+    else:
+        # If only one point, use a conservative estimate
+        if conditional_survival[0] > 0:
+            expected_remaining_lifetime = float(conditional_survival[0] * 365)  # Conservative estimate
+        else:
+            expected_remaining_lifetime = 0.0
+    
+    return {
+        "customer_id": customer_id_str,
+        "found": True,
+        "tenure_days": t0,
+        "survival_curve": survival_curve,
+        "expected_remaining_lifetime": expected_remaining_lifetime,
+    }

@@ -14,6 +14,7 @@ from analytics.survival import (
     fit_cox,
     cox_summary_json,
     predict_churn_probabilities,
+    get_customer_survival_curve,
 )
 
 from analytics.survival import km_stratified
@@ -89,6 +90,16 @@ class ChurnProbResponse(BaseModel):
     inactivity_days: int
     n_customers: int
     customers: List[Dict[str, Any]]  # List of customer churn probabilities
+
+class CustomerSurvivalResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    customer_id: str
+    found: bool
+    tenure_days: Optional[float] = None
+    survival_curve: Optional[List[Dict[str, float]]] = None
+    expected_remaining_lifetime: Optional[float] = None
+    error: Optional[str] = None
 
 @app.get("/health")
 def health() -> Dict[str, str]:
@@ -359,4 +370,47 @@ def churn_probabilities(
         inactivity_days=inactivity_days,
         n_customers=int(len(result_df)),
         customers=result_df.to_dict(orient="records"),
+    )
+
+@app.get("/survival/customer/{customer_id}", response_model=CustomerSurvivalResponse)
+def customer_survival(
+    customer_id: str,
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+) -> CustomerSurvivalResponse:
+    """
+    Get survival curve and expected remaining lifetime for a specific customer.
+    
+    Returns the survival curve from cutoff onwards and the expected remaining lifetime.
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+    ).df
+
+    df_cox = build_cox_design(cov=cov)
+
+    # Fit Cox model
+    cph = fit_cox(df_cox, penalizer=0.1)
+    
+    # Get survival curve for the customer
+    result = get_customer_survival_curve(
+        cov=cov,
+        cph=cph,
+        customer_id=customer_id,
+        include_churned=False,
+    )
+    
+    return CustomerSurvivalResponse(
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+        **result,
     )
