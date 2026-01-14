@@ -304,6 +304,8 @@ def predict_churn_probabilities(
     cph: CoxPHFitter,
     horizon_days: int,
     include_churned: bool = False,
+    prob_threshold_red: float = 0.7,
+    prob_threshold_amber_low: float = 0.4,
 ) -> pd.DataFrame:
     """
     Predicts per-customer conditional churn probability at a specified horizon using a fitted Cox model.
@@ -318,11 +320,14 @@ def predict_churn_probabilities(
         cph: Fitted CoxPHFitter model
         horizon_days: Prediction horizon in days from cutoff (e.g., 30, 60, 90)
         include_churned: If False, exclude customers already churned at cutoff (event == 1)
+        prob_threshold_red: Probability threshold for Red segment (default: 0.7)
+        prob_threshold_amber_low: Lower probability threshold for Amber segment (default: 0.4)
     
     Returns:
-        DataFrame with columns: customer_id, hazard_score, churn_prob_cond_{horizon_days}d
+        DataFrame with columns: customer_id, hazard_score, churn_prob_cond_{horizon_days}d, segment
         - hazard_score: Partial hazard (linear predictor) for continuous risk ranking (higher = higher risk)
         - churn_prob_cond_{horizon_days}d: Conditional churn probability at specified horizon
+        - segment: Risk segment (Red/Amber/Green) based on hazard_score percentiles and churn probability
         Probabilities are conditional on being alive at cutoff.
     """
     # Filter out already-churned customers unless explicitly requested
@@ -416,11 +421,36 @@ def predict_churn_probabilities(
     # For customers with very small S(t₀), set churn probability to 1.0
     churn_prob_array[very_small_s_t0] = 1.0
     
+    # Compute segmentation based on hazard_score percentiles and churn probability
+    # Percentiles for hazard_score ranking
+    p70_hazard = np.percentile(hazard_scores, 70)
+    p90_hazard = np.percentile(hazard_scores, 90)
+    
+    # Initialize segment array
+    segment_array = np.full(len(customer_ids), "Green", dtype=object)
+    
+    # Red segment: top 10% hazard_score (>= p90) AND churn_prob >= threshold
+    is_red = (hazard_scores >= p90_hazard) & (churn_prob_array >= prob_threshold_red)
+    segment_array[is_red] = "Red"
+    
+    # Amber segment: (p70-p90 hazard_score OR churn_prob 0.4-0.7) AND not Red
+    is_amber = (
+        (
+            (hazard_scores >= p70_hazard) & (hazard_scores < p90_hazard)  # p70-p90 hazard_score
+            | (churn_prob_array >= prob_threshold_amber_low) & (churn_prob_array < prob_threshold_red)  # OR prob 0.4-0.7
+        )
+        & ~is_red  # AND not already Red
+    )
+    segment_array[is_amber] = "Amber"
+    
+    # Green segment: everything else (already initialized)
+    
     # Build results DataFrame
     results_dict = {
         "customer_id": customer_ids,
         "hazard_score": hazard_scores,
         f"churn_prob_cond_{horizon_days}d": churn_prob_array,
+        "segment": segment_array,
     }
     
     return pd.DataFrame(results_dict)

@@ -240,119 +240,182 @@ with tab5:
             step=1,
             help="Number of days from cutoff to predict churn probability"
         )
+    
+    # Fixed segmentation thresholds (not user-configurable)
+    prob_threshold_red = 0.7
+    prob_threshold_amber_low = 0.4
 
     if st.button("Compute Churn Probabilities"):
         r = requests.post(
-            f"{API_URL}/survival/churn_prob?inactivity_days={inactivity_churn}&horizon_days={int(horizon_days)}",
+            f"{API_URL}/survival/churn_prob?inactivity_days={inactivity_churn}&horizon_days={int(horizon_days)}&prob_threshold_red={prob_threshold_red}&prob_threshold_amber_low={prob_threshold_amber_low}",
             timeout=180,
         )
         if r.status_code != 200:
             st.error(r.text)
         else:
             payload = r.json()
-            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
-            st.write(f"N customers (alive at cutoff): {payload['n_customers']}")
+            # Store results in session state so filters don't reset
+            st.session_state['churn_prob_payload'] = payload
+            st.session_state['churn_prob_horizon'] = int(horizon_days)
 
-            df = pd.DataFrame(payload["customers"])
-            
-            # Get the dynamic churn probability column name
-            churn_col = f"churn_prob_cond_{int(horizon_days)}d"
-            
-            # Filtering and sorting options
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                min_churn_prob = st.slider(
-                    f"Min {int(horizon_days)}-day conditional churn probability",
-                    0.0, 1.0, 0.0, 0.01,
-                    help=f"Filter customers by minimum {int(horizon_days)}-day conditional churn probability"
-                )
-            with col2:
-                max_customers = st.slider(
-                    "Max customers to display",
-                    10, 1000, 100, 10
-                )
-            with col3:
-                sort_by = st.selectbox(
-                    "Sort by",
-                    options=["hazard_score", churn_col],
-                    index=0,
-                    help="hazard_score: continuous risk ranking (partial hazard). Higher = higher risk."
-                )
-            
-            # Apply filter
-            df_filtered = df[df[churn_col] >= min_churn_prob].copy()
-            
-            # Sort by selected column
-            df_filtered = df_filtered.sort_values(sort_by, ascending=False).head(max_customers)
-            
-            st.markdown("### Customer Conditional Churn Probabilities")
-            st.caption("hazard_score: Partial hazard for continuous risk ranking. Higher values indicate higher churn risk.")
-            
-            # Build format dict dynamically
-            format_dict = {
-                "hazard_score": "{:.3f}",
-                churn_col: "{:.3f}",
-                "orders_per_month": "{:.2f}",
-                "aov": "{:.2f}",
-                "tenure_days": "{:.0f}",
-                "gap_days": "{:.0f}",
-            }
-            
-            st.dataframe(
-                df_filtered.style.format(format_dict),
-                use_container_width=True,
-                height=400
+    # Display results if available in session state
+    if 'churn_prob_payload' in st.session_state:
+        payload = st.session_state['churn_prob_payload']
+        horizon_days = st.session_state.get('churn_prob_horizon', 30)
+        
+        st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+        st.write(f"N customers (alive at cutoff): {payload['n_customers']}")
+
+        df = pd.DataFrame(payload["customers"])
+        
+        # Get the dynamic churn probability column name
+        churn_col = f"churn_prob_cond_{int(horizon_days)}d"
+        
+        # Filtering and sorting options
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            min_churn_prob = st.slider(
+                f"Min {int(horizon_days)}-day conditional churn probability",
+                0.0, 1.0, 0.0, 0.01,
+                help=f"Filter customers by minimum {int(horizon_days)}-day conditional churn probability"
             )
+        with col2:
+            segment_filter = st.selectbox(
+                "Filter by segment",
+                options=["All", "Red", "Amber", "Green"],
+                index=0,
+                help="Filter customers by risk segment"
+            )
+        with col3:
+            max_customers = st.slider(
+                "Max customers to display",
+                10, 1000, 100, 10
+            )
+        with col4:
+            sort_by = st.selectbox(
+                "Sort by",
+                options=["segment", "hazard_score", churn_col],
+                index=1,
+                help="hazard_score: continuous risk ranking (partial hazard). Higher = higher risk."
+            )
+        
+        # Apply filters
+        df_filtered = df[df[churn_col] >= min_churn_prob].copy()
+        if segment_filter != "All":
+            df_filtered = df_filtered[df_filtered["segment"] == segment_filter].copy()
+        
+        # Sort by selected column (handle segment specially)
+        if sort_by == "segment":
+            # Custom sort: Red > Amber > Green
+            segment_order = {"Red": 0, "Amber": 1, "Green": 2}
+            df_filtered = df_filtered.copy()
+            df_filtered["_sort_segment"] = df_filtered["segment"].map(segment_order)
+            df_filtered = df_filtered.sort_values("_sort_segment", ascending=True).drop("_sort_segment", axis=1)
+        else:
+            df_filtered = df_filtered.sort_values(sort_by, ascending=False)
+        
+        df_filtered = df_filtered.head(max_customers)
+        
+        st.markdown("### Customer Conditional Churn Probabilities")
+        st.caption("hazard_score: Partial hazard for continuous risk ranking. Higher values indicate higher churn risk.")
+        st.caption("Segmentation: Red = top 10% hazard_score & high prob (≥0.7); Amber = p70-p90 or medium prob (0.4-0.7); Green = rest")
+        
+        # Build format dict dynamically
+        format_dict = {
+            "hazard_score": "{:.3f}",
+            churn_col: "{:.3f}",
+            "orders_per_month": "{:.2f}",
+            "aov": "{:.2f}",
+            "tenure_days": "{:.0f}",
+            "gap_days": "{:.0f}",
+        }
+        
+        # Apply color styling to segment column
+        def color_segment(val):
+            if val == "Red":
+                return "background-color: #ffcccc"
+            elif val == "Amber":
+                return "background-color: #fff4cc"
+            elif val == "Green":
+                return "background-color: #ccffcc"
+            return ""
+        
+        styled_df = df_filtered.style.format(format_dict).applymap(
+            color_segment, subset=["segment"]
+        )
+        
+        st.dataframe(
+            styled_df,
+            use_container_width=True,
+            height=400
+        )
+        
+        if len(df_filtered) > 0:
+            # Segment distribution
+            st.markdown("### Segment Distribution")
+            segment_counts = df_filtered["segment"].value_counts()
+            fig_segment = px.bar(
+                x=segment_counts.index,
+                y=segment_counts.values,
+                title="Customer Count by Segment",
+                labels={"x": "Segment", "y": "Count"},
+                color=segment_counts.index,
+                color_discrete_map={"Red": "#ff6666", "Amber": "#ffcc66", "Green": "#66cc66"}
+            )
+            st.plotly_chart(fig_segment, use_container_width=True)
             
-            if len(df_filtered) > 0:
-                st.markdown("### Hazard Score Distribution")
-                fig_hazard = px.histogram(
-                    df_filtered,
-                    x="hazard_score",
-                    nbins=30,
-                    title="Hazard Score (Partial Hazard) Distribution",
-                    labels={"hazard_score": "Hazard Score (Partial Hazard)", "count": "Count"}
+            st.markdown("### Hazard Score Distribution")
+            fig_hazard = px.histogram(
+                df_filtered,
+                x="hazard_score",
+                nbins=30,
+                color="segment",
+                title="Hazard Score Distribution by Segment",
+                labels={"hazard_score": "Hazard Score (Partial Hazard)", "count": "Count"},
+                color_discrete_map={"Red": "#ff6666", "Amber": "#ffcc66", "Green": "#66cc66"}
+            )
+            st.plotly_chart(fig_hazard, use_container_width=True)
+            
+            st.markdown(f"### {int(horizon_days)}-Day Conditional Churn Probability Distribution")
+            fig_churn = px.histogram(
+                df_filtered,
+                x=churn_col,
+                nbins=30,
+                title=f"{int(horizon_days)}-Day Conditional Churn Probability Distribution",
+                labels={churn_col: f"{int(horizon_days)}-Day Conditional Churn Probability", "count": "Count"}
+            )
+            st.plotly_chart(fig_churn, use_container_width=True)
+            
+            st.markdown("### Churn Risk vs Customer Attributes")
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                x_attr = st.selectbox(
+                    "X axis (customer attribute)",
+                    options=["gap_days", "tenure_days", "orders_per_month", "aov"],
+                    index=0
                 )
-                st.plotly_chart(fig_hazard, use_container_width=True)
-                
-                st.markdown(f"### {int(horizon_days)}-Day Conditional Churn Probability Distribution")
-                fig_churn = px.histogram(
-                    df_filtered,
-                    x=churn_col,
-                    nbins=30,
-                    title=f"{int(horizon_days)}-Day Conditional Churn Probability Distribution",
-                    labels={churn_col: f"{int(horizon_days)}-Day Conditional Churn Probability", "count": "Count"}
+            
+            with col2:
+                y_metric = st.selectbox(
+                    "Y axis (risk metric)",
+                    options=["hazard_score", churn_col],
+                    index=0
                 )
-                st.plotly_chart(fig_churn, use_container_width=True)
-                
-                st.markdown("### Churn Risk vs Customer Attributes")
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    x_attr = st.selectbox(
-                        "X axis (customer attribute)",
-                        options=["gap_days", "tenure_days", "orders_per_month", "aov"],
-                        index=0
-                    )
-                
-                with col2:
-                    y_metric = st.selectbox(
-                        "Y axis (risk metric)",
-                        options=["hazard_score", churn_col],
-                        index=0
-                    )
-                
-                y_label = f"{int(horizon_days)}-Day Conditional Churn Probability" if y_metric == churn_col else "Hazard Score (Partial Hazard)"
-                fig_scatter = px.scatter(
-                    df_filtered,
-                    x=x_attr,
-                    y=y_metric,
-                    hover_data=["customer_id"],
-                    title=f"{y_label} vs {x_attr.replace('_', ' ').title()}",
-                    labels={
-                        y_metric: y_label,
-                        x_attr: x_attr.replace("_", " ").title()
-                    }
-                )
-                st.plotly_chart(fig_scatter, use_container_width=True)
+            
+            y_label = f"{int(horizon_days)}-Day Conditional Churn Probability" if y_metric == churn_col else "Hazard Score (Partial Hazard)"
+            fig_scatter = px.scatter(
+                df_filtered,
+                x=x_attr,
+                y=y_metric,
+                color="segment",
+                hover_data=["customer_id"],
+                title=f"{y_label} vs {x_attr.replace('_', ' ').title()}",
+                labels={
+                    y_metric: y_label,
+                    x_attr: x_attr.replace("_", " ").title()
+                },
+                color_discrete_map={"Red": "#ff6666", "Amber": "#ffcc66", "Green": "#66cc66"}
+            )
+            st.plotly_chart(fig_scatter, use_container_width=True)
 

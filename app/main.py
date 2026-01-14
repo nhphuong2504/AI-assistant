@@ -304,6 +304,8 @@ def cox_model(
 def churn_probabilities(
     inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
     horizon_days: int = Query(30, ge=1, le=3650, description="Prediction horizon in days from cutoff"),
+    prob_threshold_red: float = Query(0.7, ge=0.0, le=1.0, description="Probability threshold for Red segment (default: 0.7)"),
+    prob_threshold_amber_low: float = Query(0.4, ge=0.0, le=1.0, description="Lower probability threshold for Amber segment (default: 0.4)"),
 ) -> ChurnProbResponse:
     """
     Compute per-customer conditional churn probability at a specified horizon using Cox model.
@@ -312,6 +314,7 @@ def churn_probabilities(
     P(churn within H | alive at cutoff) = 1 - S(t₀ + H) / S(t₀)
     
     Customers already churned at cutoff are excluded by default.
+    Includes segmentation: Red (high risk), Amber (medium risk), Green (low risk).
     """
     sql = """
     SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
@@ -338,6 +341,8 @@ def churn_probabilities(
         cph=cph,
         horizon_days=horizon_days,
         include_churned=False,  # Exclude already-churned customers
+        prob_threshold_red=prob_threshold_red,
+        prob_threshold_amber_low=prob_threshold_amber_low,
     )
     
     # Merge with some customer attributes for context
