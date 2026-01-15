@@ -51,3 +51,6 @@ print(
         ]
     ].describe()
 )
+
+print("\n=== RANDOM 20 ROWS ===")
+print(cov.sample(n=min(20, len(cov)), random_state=42))
