@@ -5,10 +5,12 @@ import plotly.express as px
 
 API_URL = st.sidebar.text_input("API URL", "http://127.0.0.1:8000")
 
+#streamlit run ui/app.py
+
 st.title("Retail Data Assistant — SQL Playground")
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Schema", "SQL", "Ask", "CLV"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["Schema", "SQL", "Ask", "CLV", "Survival"]
 )
 
 
@@ -117,5 +119,34 @@ with tab4:
             if "clv" in df.columns:
                 fig = px.bar(df, x="customer_id", y="clv", title="Top customers by predicted CLV")
                 st.plotly_chart(fig, use_container_width=True)
+
+with tab5:
+    st.subheader("Survival Analysis")
+    st.caption("Cutoff date is fixed at 2011-12-09 (inclusive). Inactivity days is fixed at 90 days.")
+
+    st.markdown("## Kaplan–Meier (All customers)")
+
+    if st.button("Run KM (All customers)"):
+        r = requests.post(
+            f"{API_URL}/survival/km?inactivity_days=90",
+            timeout=180,
+        )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+            st.write(f"N customers: {payload['n_customers']} | Churn rate: {payload['churn_rate']:.3f}")
+
+            # Build a plotting dataframe
+            plot_df = pd.DataFrame(payload["survival_curve"])
+
+            fig = px.line(
+                plot_df,
+                x="time",
+                y="survival",
+                title="Kaplan–Meier Survival Curve (All customers)",
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
 

@@ -7,11 +7,14 @@ import pandas as pd
 from analytics.clv import build_rfm, fit_models, predict_clv
 from analytics.survival import (
     build_covariate_table,
+    fit_km_all,
     CUTOFF_DATE,
     INACTIVITY_DAYS,
 )
 
 app = FastAPI(title="Retail Data Assistant API", version="0.1")
+
+#uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 
 
 class QueryRequest(BaseModel):
@@ -48,6 +51,14 @@ class CLVResponse(BaseModel):
     horizon_days: int
     top_customers: List[Dict[str, Any]]
     summary: Dict[str, Any]
+
+
+class KMResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    n_customers: int
+    churn_rate: float
+    survival_curve: List[Dict[str, float]]
 
 
 
@@ -153,5 +164,40 @@ def clv(req: CLVRequest) -> CLVResponse:
         horizon_days=req.horizon_days,
         top_customers=top.to_dict(orient="records"),
         summary=summary,
+    )
+
+
+@app.post("/survival/km", response_model=KMResponse)
+def km_all(inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition")) -> KMResponse:
+    """
+    Fit Kaplan-Meier survival model on all customers.
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+    ).df
+
+    kmf = fit_km_all(cov)
+
+    curve = [
+        {"time": float(t), "survival": float(s)}
+        for t, s in zip(kmf.timeline, kmf.survival_function_.iloc[:, 0])
+    ]
+
+    return KMResponse(
+        cutoff_date=CUTOFF_DATE,
+        inactivity_days=inactivity_days,
+        n_customers=len(cov),
+        churn_rate=float(cov["event"].mean()),
+        survival_curve=curve,
     )
 

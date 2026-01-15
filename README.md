@@ -81,3 +81,19 @@ Repeating the Cox analysis on repeat buyers sharpened this narrative further. In
 By the end of Day 5, the structure of churn in this business was clear. Recency and engagement intensity dominate churn risk, tenure reflects survivorship rather than active behavior, product diversity increases retention through switching costs, and monetary value is largely secondary once behavior is known. This understanding aligned perfectly with the CLV results and provided a causal backbone for everything that would follow.
 
 Day 5 did not produce a flashy new model; it produced clarity. It prevented me from optimizing for the wrong signals and established a principled foundation for churn classification, uplift modeling, and causal analysis. Survival analysis forced a shift from asking whether churn could be predicted to understanding what governs customer lifetime. That shift made the entire system stronger.
+
+
+Kaplan-Meier:
+
+- About 26% of customers churn immediately after the first inactivity window --- Roughly 1 in 4 customers never come back after their first purchase.
+- Retention stabilizes after the first churn wave, but customers continue to drop off steadily.
+- 50% of customers churn within ~1 year
+- 50% survive longer than 1 year
+
+Cox-baseline:
+
+- fit with duration, event and covariates: frequency_rate, monetary_value, product_diversity, is_uk (not include recency_from_cutoff, and tenure_days because will make label leakage and related to duration)
+        Results: monetary_value, is_uk has no clear effect
+        -> Change frequency_rate to n_orders for simpler to explain and avoid tenure day -> same results -> good
+        -> improve monetary by log -> good sign now
+        -> drop is_uk

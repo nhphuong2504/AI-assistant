@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 from dataclasses import dataclass
+from typing import Tuple, Dict, Any, List
+from lifelines import KaplanMeierFitter, CoxPHFitter
+from lifelines.utils import concordance_index
 
 # --------------------
 # GLOBAL MODEL ASSUMPTIONS
@@ -24,11 +27,17 @@ def build_covariate_table(
     Builds a customer-level table at a fixed cutoff date (inclusive),
     using invoice-level orders.
 
-    Output columns (core):
-      customer_id, duration, event,
-      frequency, recency, tenure_days, gap_days,
-      monetary_value, aov, orders_per_month,
-      product_diversity, is_uk
+    Output columns:
+      1. customer_id: Unique identifier of the customer; one row per customer.
+      2. duration: Number of days from first order to churn time (if event=1) or cutoff (if event=0).
+      3. event: Churn indicator (1=churned, 0=censored).
+      4. tenure_days: Number of days between first order date and cutoff date.
+      5. recency_from_cutoff: Number of days between last order date and cutoff date.
+      6. n_orders: Total number of distinct orders (invoices) up to cutoff.
+      7. frequency_rate: Purchase frequency as orders per month (n_orders / (tenure_days/30)).
+      8. monetary_value: Mean order value (total_revenue / n_orders).
+      9. product_diversity: Count of distinct product codes (stock_code) purchased.
+      10. is_uk: Binary indicator (1 if any order from UK, 0 otherwise).
     """
     df = transactions.copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
@@ -52,14 +61,14 @@ def build_covariate_table(
     first = g["order_date"].min()
     last = g["order_date"].max()
     n_orders = g["invoice_no"].nunique()
+    total_revenue = g["order_value"].sum()
 
     # Time quantities (days)
     tenure_days = (cutoff - first).dt.days
-    recency = (last - first).dt.days
-    gap_days = (cutoff - last).dt.days  # "recent visits" proxy: lower = more recent
+    recency_from_cutoff = (cutoff - last).dt.days
 
     # Survival event: churn if inactive for >= inactivity_days at cutoff
-    event = (gap_days >= inactivity_days).astype(int)
+    event = (recency_from_cutoff >= inactivity_days).astype(int)
 
     # Duration: if churned, event time = last + inactivity_days; else censored at cutoff
     duration = pd.Series(index=first.index, dtype=float)
@@ -71,16 +80,15 @@ def build_covariate_table(
     duration[event == 0] = tenure_days[event == 0]
 
     # Behavioral covariates
-    frequency = (n_orders).astype(float)
+    n_orders_float = n_orders.astype(float)
 
-    monetary_value = g["order_value"].mean()
-    monetary_value = monetary_value.where(n_orders >= 2, np.nan)
+    # Monetary value: mean order value (total_revenue / n_orders)
+    monetary_value = total_revenue / n_orders
+    monetary_value = monetary_value.astype(float)
 
-    total_revenue = g["order_value"].sum()
-    aov = total_revenue / n_orders
-
-    orders_per_month = n_orders / (tenure_days / 30.0)
-    orders_per_month = orders_per_month.replace([np.inf, -np.inf], np.nan)
+    # Frequency rate: orders per month
+    frequency_rate = n_orders / (tenure_days / 30.0)
+    frequency_rate = frequency_rate.replace([np.inf, -np.inf], np.nan).astype(float)
 
     product_diversity = (
         df.groupby("customer_id")["stock_code"]
@@ -102,13 +110,11 @@ def build_covariate_table(
         "customer_id": first.index,
         "duration": duration,
         "event": event.astype(int),
-        "frequency": frequency,
-        "recency": recency.astype(float),
         "tenure_days": tenure_days.astype(float),
-        "gap_days": gap_days.astype(float),
-        "monetary_value": monetary_value.astype(float),
-        "aov": aov.astype(float),
-        "orders_per_month": orders_per_month.astype(float),
+        "recency_from_cutoff": recency_from_cutoff.astype(float),
+        "n_orders": n_orders_float,
+        "frequency_rate": frequency_rate,
+        "monetary_value": monetary_value,
         "product_diversity": product_diversity,
         "is_uk": is_uk,
     }).reset_index(drop=True)
@@ -117,7 +123,645 @@ def build_covariate_table(
     cov = cov[
         (cov["duration"] > 0) &
         (cov["tenure_days"] > 0) &
-        (cov["gap_days"] >= 0)
+        (cov["recency_from_cutoff"] >= 0)
     ].copy()
 
     return CovariateTable(df=cov, cutoff_date=cutoff)
+
+
+def fit_km_all(covariates: pd.DataFrame) -> KaplanMeierFitter:
+    """
+    Fits a Kaplan-Meier survival model on all customers.
+    
+    Args:
+        covariates: DataFrame with 'duration' and 'event' columns from build_covariate_table
+        
+    Returns:
+        Fitted KaplanMeierFitter model
+    """
+    kmf = KaplanMeierFitter()
+    kmf.fit(
+        durations=covariates["duration"],
+        event_observed=covariates["event"],
+        label="All customers",
+    )
+    return kmf
+
+
+def prepare_cox_data(
+    covariates: pd.DataFrame,
+    covariate_cols: List[str] = None,
+) -> pd.DataFrame:
+    """
+    Prepares data for Cox model by selecting covariates and dropping missing values.
+    Applies log transformation to product_diversity if requested.
+    
+    Args:
+        covariates: DataFrame from build_covariate_table
+        covariate_cols: List of covariate column names to include. 
+                       Default: ['n_orders', 'log_product_diversity']
+    
+    Returns:
+        DataFrame with duration, event, and selected covariates (no missing values)
+    """
+    if covariate_cols is None:
+        covariate_cols = ['n_orders', 'log_product_diversity']
+    
+    df = covariates.copy()
+    
+    # Create log transformation of monetary_value if log_monetary_value is requested
+    if 'log_monetary_value' in covariate_cols and 'monetary_value' in df.columns:
+        df['log_monetary_value'] = np.log1p(df['monetary_value'])
+    
+    # Create log transformation of product_diversity if log_product_diversity is requested
+    if 'log_product_diversity' in covariate_cols and 'product_diversity' in df.columns:
+        df['log_product_diversity'] = np.log1p(df['product_diversity'])
+    
+    # Select required columns: duration, event, and requested covariates
+    # For log_monetary_value, we need the transformed column, not monetary_value
+    required_cols = ['duration', 'event']
+    for col in covariate_cols:
+        if col in df.columns:
+            required_cols.append(col)
+    
+    df = df[required_cols].copy()
+    
+    # Drop rows with missing values in the final covariate columns
+    final_covariate_cols = [col for col in covariate_cols if col in df.columns]
+    df = df.dropna(subset=final_covariate_cols)
+    
+    return df
+
+
+def split_train_validation(
+    df: pd.DataFrame,
+    train_frac: float = 0.8,
+    random_state: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Splits data into train and validation sets by customer (random split).
+    
+    Args:
+        df: DataFrame with customer data
+        train_frac: Fraction of data for training (default: 0.8)
+        random_state: Random seed for reproducibility
+    
+    Returns:
+        Tuple of (train_df, validation_df)
+    """
+    np.random.seed(random_state)
+    n = len(df)
+    indices = np.arange(n)
+    np.random.shuffle(indices)
+    
+    n_train = int(n * train_frac)
+    train_indices = indices[:n_train]
+    val_indices = indices[n_train:]
+    
+    train_df = df.iloc[train_indices].copy()
+    val_df = df.iloc[val_indices].copy()
+    
+    return train_df, val_df
+
+
+def fit_cox_baseline(
+    covariates: pd.DataFrame,
+    covariate_cols: List[str] = None,
+    train_frac: float = 0.8,
+    random_state: int = 42,
+    penalizer: float = 0.1,
+) -> Dict[str, Any]:
+    """
+    Fits a baseline Cox proportional hazards model to study customer churn timing.
+    
+    Steps:
+    1. Drop rows with missing values in selected covariates
+    2. Split data into train/validation sets (80/20)
+    3. Fit Cox model on training data
+    4. Generate summary with interpretation
+    
+    Args:
+        covariates: DataFrame from build_covariate_table
+        covariate_cols: List of covariate column names. 
+                       Default: ['n_orders', 'log_product_diversity']
+        train_frac: Fraction for training (default: 0.8)
+        random_state: Random seed for split
+        penalizer: L2 penalizer for Cox model (default: 0.1)
+    
+    Returns:
+        Dictionary with:
+        - model: Fitted CoxPHFitter
+        - summary: DataFrame with coefficients, hazard ratios, p-values
+        - interpretation: Dictionary with coefficient interpretations
+        - flags: Dictionary with warnings (unexpected signs, large SE, non-significant)
+        - n_train: Number of training samples
+        - n_validation: Number of validation samples
+        - n_dropped: Number of rows dropped due to missing values
+        - train_df: Training dataset
+        - validation_df: Validation dataset
+    """
+    if covariate_cols is None:
+        covariate_cols = ['n_orders', 'log_product_diversity']
+    
+    # Step 1: Prepare data (drop missing)
+    n_before = len(covariates)
+    df_cox = prepare_cox_data(covariates, covariate_cols)
+    n_after = len(df_cox)
+    n_dropped = n_before - n_after
+    
+    # Step 2: Split train/validation
+    train_df, val_df = split_train_validation(df_cox, train_frac, random_state)
+    
+    # Step 3: Fit Cox model on training data
+    cph = CoxPHFitter(penalizer=penalizer)
+    cph.fit(train_df, duration_col='duration', event_col='event')
+    
+    # Step 4: Generate summary
+    summary = cph.summary.copy()
+    summary['hazard_ratio'] = np.exp(summary['coef'])
+    summary = summary.reset_index().rename(columns={'index': 'covariate'})
+    
+    # Interpretation and flags
+    interpretation = {}
+    flags = {
+        'unexpected_signs': [],
+        'large_se': [],
+        'non_significant': [],
+    }
+    
+    # Expected signs based on business logic:
+    # - n_orders: negative (more orders → lower churn risk)
+    # - monetary_value: negative (higher value → lower churn risk)
+    # - log_monetary_value: negative (higher value → lower churn risk)
+    # - product_diversity: negative (more diversity → lower churn risk)
+    # - log_product_diversity: negative (more diversity → lower churn risk)
+    
+    expected_signs = {
+        'n_orders': 'negative',
+        'monetary_value': 'negative',
+        'log_monetary_value': 'negative',
+        'product_diversity': 'negative',
+        'log_product_diversity': 'negative',
+    }
+    
+    for _, row in summary.iterrows():
+        cov = row['covariate']
+        coef = row['coef']
+        se = row['se(coef)']
+        p = row['p']
+        hr = row['hazard_ratio']
+        
+        # Interpretation
+        if coef > 0:
+            interpretation[cov] = {
+                'sign': 'positive',
+                'meaning': 'Higher churn risk (shorter lifetime)',
+                'hazard_ratio': hr,
+                'effect': f'Each unit increase → {hr:.3f}x higher hazard'
+            }
+        else:
+            interpretation[cov] = {
+                'sign': 'negative',
+                'meaning': 'Lower churn risk (longer lifetime)',
+                'hazard_ratio': hr,
+                'effect': f'Each unit increase → {hr:.3f}x lower hazard'
+            }
+        
+        # Flags
+        expected = expected_signs.get(cov)
+        if expected is not None:
+            actual_sign = 'positive' if coef > 0 else 'negative'
+            if actual_sign != expected:
+                flags['unexpected_signs'].append({
+                    'covariate': cov,
+                    'expected': expected,
+                    'actual': actual_sign,
+                    'coef': coef,
+                })
+        
+        # Large standard error (relative to coefficient)
+        if abs(se) > abs(coef) * 2:
+            flags['large_se'].append({
+                'covariate': cov,
+                'coef': coef,
+                'se': se,
+                'ratio': abs(se / coef) if coef != 0 else float('inf'),
+            })
+        
+        # Non-significant (p > 0.05)
+        if p > 0.05:
+            flags['non_significant'].append({
+                'covariate': cov,
+                'p': p,
+                'coef': coef,
+            })
+    
+    return {
+        'model': cph,
+        'summary': summary,
+        'interpretation': interpretation,
+        'flags': flags,
+        'n_train': len(train_df),
+        'n_validation': len(val_df),
+        'n_dropped': n_dropped,
+        'train_df': train_df,
+        'validation_df': val_df,
+    }
+
+
+def validate_cox_model(
+    model: CoxPHFitter,
+    train_df: pd.DataFrame,
+    validation_df: pd.DataFrame,
+) -> Dict[str, Any]:
+    """
+    Validates a fitted Cox proportional hazards model.
+    
+    Performs:
+    1. Proportional hazards assumption testing using Schoenfeld residuals
+    2. Predictive performance evaluation using C-index on validation set
+    
+    Args:
+        model: Fitted CoxPHFitter model
+        train_df: Training dataset with duration, event, and covariates
+        validation_df: Validation dataset with duration, event, and covariates
+    
+    Returns:
+        Dictionary with:
+        - ph_tests: DataFrame with PH test results (global and per-covariate)
+        - ph_violations: List of covariates violating PH assumption (p < 0.05)
+        - c_index: Concordance index on validation set
+        - interpretation: Dictionary with validation results interpretation
+    """
+    from scipy import stats
+    from scipy.stats import combine_pvalues
+    
+    # Expected covariates (should match model)
+    expected_covariates = list(model.params_.index)
+    
+    # Step 1: Check proportional hazards assumption on training data
+    ph_test_results = []
+    ph_violations = []
+    ph_test_failed = False
+    ph_test_error_msg = None
+    
+    try:
+        # Use check_assumptions method for reliable PH testing
+        # This method performs Schoenfeld residual tests
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # check_assumptions may print to stdout, but we'll capture the results
+            model.check_assumptions(train_df, p_value_threshold=0.05, show_plots=False)
+        
+        # Get Schoenfeld residuals
+        residuals = model.compute_residuals(train_df, kind='schoenfeld')
+        
+        # Verify we have residuals for all expected covariates
+        missing_covariates = [c for c in expected_covariates if c not in residuals.columns]
+        if missing_covariates:
+            ph_test_failed = True
+            ph_test_error_msg = f"Missing residuals for covariates: {missing_covariates}"
+        else:
+            # For each covariate, test if residuals are correlated with time
+            for covariate in expected_covariates:
+                # Get valid residuals (non-null)
+                valid_mask = residuals[covariate].notna()
+                n_valid = valid_mask.sum()
+                
+                if n_valid < 3:
+                    # Not enough data for test
+                    ph_test_results.append({
+                        'covariate': covariate,
+                        'test_statistic': np.nan,
+                        'p_value': np.nan,
+                        'violates_ph': False,
+                        'note': f'Insufficient data (n={n_valid})'
+                    })
+                    ph_test_failed = True
+                    continue
+                
+                res_values = residuals.loc[valid_mask, covariate].values
+                time_values = train_df.loc[valid_mask, 'duration'].values
+                
+                # Test correlation between residuals and time using Kendall's tau
+                # (rank correlation, more robust than Pearson)
+                tau, p_value = stats.kendalltau(time_values, res_values)
+                
+                # Check for NaN results
+                if np.isnan(p_value) or np.isnan(tau):
+                    ph_test_results.append({
+                        'covariate': covariate,
+                        'test_statistic': np.nan,
+                        'p_value': np.nan,
+                        'violates_ph': False,
+                        'note': 'Test computation produced NaN'
+                    })
+                    ph_test_failed = True
+                else:
+                    ph_test_results.append({
+                        'covariate': covariate,
+                        'test_statistic': tau,
+                        'p_value': p_value,
+                        'violates_ph': p_value < 0.05,
+                    })
+                    
+                    if p_value < 0.05:
+                        ph_violations.append(covariate)
+            
+            # Global test (overall PH assumption)
+            # Use Fisher's combined probability test across all covariates
+            valid_p_values = [r['p_value'] for r in ph_test_results 
+                            if not np.isnan(r['p_value'])]
+            
+            if len(valid_p_values) > 0:
+                global_stat, global_p = combine_pvalues(valid_p_values, method='fisher')
+                
+                # Check if global test is valid
+                if np.isnan(global_p):
+                    ph_test_failed = True
+                    global_entry = {
+                        'covariate': 'global',
+                        'test_statistic': np.nan,
+                        'p_value': np.nan,
+                        'violates_ph': False,
+                        'note': 'Global test computation produced NaN'
+                    }
+                else:
+                    global_entry = {
+                        'covariate': 'global',
+                        'test_statistic': global_stat,
+                        'p_value': global_p,
+                        'violates_ph': global_p < 0.05,
+                    }
+            else:
+                ph_test_failed = True
+                global_entry = {
+                    'covariate': 'global',
+                    'test_statistic': np.nan,
+                    'p_value': np.nan,
+                    'violates_ph': False,
+                    'note': 'No valid p-values for global test'
+                }
+            
+            # Create DataFrame with global test first, then per-covariate tests
+            ph_tests_df = pd.concat([
+                pd.DataFrame([global_entry]),
+                pd.DataFrame(ph_test_results)
+            ], ignore_index=True)
+            
+    except Exception as e:
+        # If PH test computation fails, report as failure
+        ph_test_failed = True
+        ph_test_error_msg = str(e)
+        ph_tests_df = pd.DataFrame([{
+            'covariate': 'computation_error',
+            'test_statistic': np.nan,
+            'p_value': np.nan,
+            'violates_ph': False,
+            'note': f'PH test failed: {ph_test_error_msg}'
+        }])
+        ph_violations = []
+    
+    # Verify all expected covariates have valid test results
+    if not ph_test_failed:
+        for cov in expected_covariates:
+            cov_results = ph_tests_df[ph_tests_df['covariate'] == cov]
+            if len(cov_results) == 0 or cov_results['p_value'].isna().any():
+                ph_test_failed = True
+                break
+    
+    # Step 2: Evaluate predictive performance on validation set
+    # Compute risk scores (partial hazards) for validation data
+    c_index = np.nan
+    c_index_failed = False
+    
+    try:
+        # Get covariates (exclude duration and event)
+        covariate_cols = [col for col in validation_df.columns 
+                         if col not in ['duration', 'event']]
+        
+        # Predict partial hazard (risk scores)
+        # Higher partial hazard = higher churn risk = shorter survival
+        risk_scores = model.predict_partial_hazard(validation_df[covariate_cols])
+        
+        # INVERT risk scores: higher score should correspond to longer survival
+        # For C-index, we want: higher predicted score = longer survival time
+        # So we use negative of risk scores (or 1/risk_scores, but negative is more stable)
+        survival_scores = -risk_scores.values
+        
+        # Compute C-index
+        # C-index measures: P(predicted longer survival > predicted shorter survival | actual longer survival > actual shorter survival)
+        c_index = concordance_index(
+            event_times=validation_df['duration'].values,
+            predicted_scores=survival_scores,
+            event_observed=validation_df['event'].values,
+        )
+        
+        # Validate C-index is in valid range [0, 1]
+        if np.isnan(c_index) or c_index < 0 or c_index > 1:
+            c_index_failed = True
+            if np.isnan(c_index):
+                c_index = np.nan
+            else:
+                c_index = np.clip(c_index, 0, 1)
+                
+    except Exception as e:
+        c_index = np.nan
+        c_index_failed = True
+    
+    # Interpretation
+    # PH assumption holds only if:
+    # 1. Tests were computed successfully (no failures)
+    # 2. All covariates have valid (non-NaN) test results
+    # 3. No covariate has p < 0.05
+    ph_assumption_holds = (
+        not ph_test_failed and
+        len(ph_violations) == 0 and
+        not ph_tests_df.empty and
+        ph_tests_df['covariate'].iloc[0] != 'computation_error' and
+        not ph_tests_df['p_value'].isna().any()
+    )
+    
+    ph_evaluable = not ph_test_failed and not ph_tests_df.empty and \
+                   ph_tests_df['covariate'].iloc[0] != 'computation_error'
+    
+    # C-index interpretation
+    if np.isnan(c_index) or c_index_failed:
+        c_index_interpretation = "C-index computation failed or produced invalid result"
+        acceptable_performance = False
+    elif c_index < 0.5:
+        c_index_interpretation = f"Poor discriminative performance (C-index={c_index:.4f} < 0.5, worse than random)"
+        acceptable_performance = False
+    elif c_index < 0.6:
+        c_index_interpretation = f"Weak discriminative performance (C-index={c_index:.4f} < 0.6)"
+        acceptable_performance = False
+    elif c_index >= 0.6 and c_index < 0.7:
+        c_index_interpretation = f"Moderate discriminative performance (C-index={c_index:.4f})"
+        acceptable_performance = True
+    elif c_index >= 0.7:
+        c_index_interpretation = f"Good discriminative performance (C-index={c_index:.4f} >= 0.7)"
+        acceptable_performance = True
+    else:
+        c_index_interpretation = f"Discriminative performance (C-index={c_index:.4f})"
+        acceptable_performance = c_index >= 0.6
+    
+    interpretation = {
+        'ph_assumption_holds': ph_assumption_holds,
+        'ph_evaluable': ph_evaluable,
+        'ph_violations': ph_violations,
+        'ph_test_failed': ph_test_failed,
+        'ph_test_error': ph_test_error_msg,
+        'acceptable_performance': acceptable_performance,
+        'c_index_interpretation': c_index_interpretation,
+        'c_index_failed': c_index_failed,
+    }
+    
+    return {
+        'ph_tests': ph_tests_df,
+        'ph_violations': ph_violations,
+        'c_index': c_index,
+        'interpretation': interpretation,
+    }
+
+
+def score_customers(
+    model: CoxPHFitter,
+    transactions: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
+) -> pd.DataFrame:
+    """
+    Leakage-free scoring and ranking pipeline using a fitted Cox model.
+    
+    Computes risk scores for customers at a cutoff date using only historical data.
+    Risk scores represent relative churn risk for prioritization, not probabilities.
+    
+    Args:
+        model: Fitted CoxPHFitter model (must NOT be refit)
+        transactions: DataFrame with customer_id, invoice_no, invoice_date, revenue, stock_code
+        cutoff_date: Cutoff date (inclusive) for feature computation (YYYY-MM-DD)
+    
+    Returns:
+        DataFrame with columns:
+        - customer_id: Customer identifier
+        - n_orders: Total number of distinct orders per customer
+        - log_monetary_value: Log-transformed mean order value per customer
+        - product_diversity: Number of unique products purchased per customer
+        - risk_score: Partial hazard (higher = higher churn risk)
+        - risk_rank: Rank by risk_score (1 = highest risk)
+        - risk_percentile: Percentile rank (0-100, higher = higher risk)
+        - risk_bucket: Risk category (High/Medium/Low based on percentiles)
+    
+    Note:
+        Risk scores represent relative churn risk and are intended for prioritization,
+        not probability estimation.
+    """
+    # Step 1: Feature construction at cutoff (leakage-free)
+    df = transactions.copy()
+    df["invoice_date"] = pd.to_datetime(df["invoice_date"])
+    cutoff = pd.to_datetime(cutoff_date)
+    
+    # Filter to data up to cutoff (inclusive)
+    df = df[df["invoice_date"] <= cutoff]
+    df = df[df["customer_id"].notna()]
+    df = df[df["revenue"] > 0]
+    
+    # Invoice-level orders
+    orders = (
+        df.groupby(["customer_id", "invoice_no"], as_index=False)
+          .agg(
+              order_date=("invoice_date", "min"),
+              order_value=("revenue", "sum"),
+          )
+    )
+    
+    g = orders.groupby("customer_id")
+    n_orders = g["invoice_no"].nunique()
+    total_revenue = g["order_value"].sum()
+    
+    # Compute features (NO duration, event, recency_from_cutoff, or tenure_days)
+    # n_orders: total number of distinct orders per customer
+    n_orders_series = n_orders.astype(float)
+    
+    # monetary_value: mean order value
+    monetary_value = total_revenue / n_orders
+    monetary_value = monetary_value.astype(float)
+    
+    # log_monetary_value: log-transformed mean order value
+    log_monetary_value = np.log1p(monetary_value)
+    
+    # product_diversity: number of unique products purchased per customer
+    product_diversity = (
+        df.groupby("customer_id")["stock_code"]
+          .nunique()
+          .reindex(n_orders.index)
+          .fillna(0)
+          .astype(float)
+    )
+    
+    # Create feature dataframe
+    feature_df = pd.DataFrame({
+        "customer_id": n_orders.index,
+        "n_orders": n_orders_series,
+        "log_monetary_value": log_monetary_value,
+        "product_diversity": product_diversity,
+    }).reset_index(drop=True)
+    
+    # Drop rows with missing values in required features
+    feature_df = feature_df.dropna(subset=["n_orders", "log_monetary_value", "product_diversity"])
+    
+    # Step 2: Risk score computation using fitted model
+    # Get covariate columns (must match model's expected covariates)
+    covariate_cols = list(model.params_.index)
+    
+    # Verify we have all required covariates
+    missing_cols = [col for col in covariate_cols if col not in feature_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required covariates in feature_df: {missing_cols}")
+    
+    # Compute risk scores (partial hazards)
+    # Higher score = higher churn risk
+    risk_scores = model.predict_partial_hazard(feature_df[covariate_cols])
+    
+    # Step 3: Customer ranking
+    result_df = feature_df.copy()
+    result_df["risk_score"] = risk_scores.values
+    
+    # Rank by risk_score (descending: highest risk = rank 1)
+    result_df["risk_rank"] = result_df["risk_score"].rank(method="min", ascending=False).astype(int)
+    
+    # Compute percentile (0-100, higher = higher risk)
+    result_df["risk_percentile"] = (
+        result_df["risk_score"].rank(method="min", pct=True, ascending=False) * 100
+    ).round(2)
+    
+    # Assign risk buckets based on percentiles
+    # Top 10% → High risk
+    # Next 20% (10-30%) → Medium risk
+    # Remaining (30-100%) → Low risk
+    def assign_risk_bucket(percentile):
+        if percentile <= 10:
+            return "High"
+        elif percentile <= 30:
+            return "Medium"
+        else:
+            return "Low"
+    
+    result_df["risk_bucket"] = result_df["risk_percentile"].apply(assign_risk_bucket)
+    
+    # Sort by risk_score descending (highest risk first)
+    result_df = result_df.sort_values("risk_score", ascending=False).reset_index(drop=True)
+    
+    # Select and order output columns
+    output_cols = [
+        "customer_id",
+        "n_orders",
+        "log_monetary_value",
+        "product_diversity",
+        "risk_score",
+        "risk_rank",
+        "risk_percentile",
+        "risk_bucket",
+    ]
+    
+    return result_df[output_cols]

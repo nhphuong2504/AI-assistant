@@ -33,8 +33,8 @@ print("Churn rate:", round(cov["event"].mean(), 3))
 
 print("\n=== TOP FREQUENCY CUSTOMERS ===")
 print(
-    cov.sort_values("frequency", ascending=False)[
-        ["customer_id", "frequency", "tenure_days"]
+    cov.sort_values("n_orders", ascending=False)[
+        ["customer_id", "n_orders", "tenure_days"]
     ].head(5)
 )
 
@@ -42,15 +42,15 @@ print("\n=== FEATURE SUMMARY ===")
 print(
     cov[
         [
-            "frequency",
-            "recency",
+            "n_orders",
+            "recency_from_cutoff",
             "tenure_days",
-            "orders_per_month",
+            "frequency_rate",
             "product_diversity",
-            "aov",
+            "monetary_value",
         ]
     ].describe()
 )
 
 print("\n=== RANDOM 20 ROWS ===")
-print(cov.sample(n=min(20, len(cov)), random_state=42))
+print(cov.sample(n=min(20, len(cov))))
