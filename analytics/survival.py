@@ -649,7 +649,7 @@ def score_customers(
         - product_diversity: Number of unique products purchased per customer
         - risk_score: Partial hazard (higher = higher churn risk)
         - risk_rank: Rank by risk_score (1 = highest risk)
-        - risk_percentile: Percentile rank (0-100, higher = higher risk)
+        - risk_percentile: Percentile rank 
         - risk_bucket: Risk category (High/Medium/Low based on percentiles)
     
     Note:
@@ -732,17 +732,17 @@ def score_customers(
     
     # Compute percentile (0-100, higher = higher risk)
     result_df["risk_percentile"] = (
-        result_df["risk_score"].rank(method="min", pct=True, ascending=False) * 100
+        result_df["risk_score"].rank(method="min", pct=True, ascending=True) * 100
     ).round(2)
     
     # Assign risk buckets based on percentiles
-    # Top 10% → High risk
-    # Next 20% (10-30%) → Medium risk
-    # Remaining (30-100%) → Low risk
+    # Top 10% (90-100%) → High risk
+    # Next 20% (70-90%) → Medium risk
+    # Remaining (0-70%) → Low risk
     def assign_risk_bucket(percentile):
-        if percentile <= 10:
+        if percentile >= 90:
             return "High"
-        elif percentile <= 30:
+        elif percentile >= 70:
             return "Medium"
         else:
             return "Low"
@@ -765,3 +765,130 @@ def score_customers(
     ]
     
     return result_df[output_cols]
+
+
+def predict_churn_probability(
+    model: CoxPHFitter,
+    transactions: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
+    X_days: int = 90,
+    inactivity_days: int = INACTIVITY_DAYS,
+) -> pd.DataFrame:
+    """
+    Computes conditional churn probability for active customers.
+    
+    For each active customer (event == 0), computes:
+    P(churn in next X days | survived to t0) = 1 - S(t0 + X | x) / S(t0 | x)
+    
+    Where:
+    - t0 = customer's tenure_days at cutoff
+    - X = prediction horizon (X_days)
+    - S(t | x) = individual survival function from Cox model
+    
+    Args:
+        model: Fitted CoxPHFitter model (must NOT be refit)
+        transactions: DataFrame with customer_id, invoice_no, invoice_date, revenue, stock_code
+        cutoff_date: Cutoff date (inclusive) for feature computation (YYYY-MM-DD)
+        X_days: Prediction horizon in days (default: 90)
+        inactivity_days: Inactivity days threshold for churn definition (default: 90)
+    
+    Returns:
+        DataFrame with columns:
+        - customer_id: Customer identifier
+        - t0: Current duration (tenure_days) at cutoff
+        - X_days: Prediction horizon
+        - churn_probability: Conditional probability of churn in next X days
+        - survival_at_t0: Survival probability at t0
+        - survival_at_t0_plus_X: Survival probability at t0 + X
+    """
+    # Step 1: Build covariate table to get tenure_days and event
+    cov_table = build_covariate_table(
+        transactions=transactions,
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+    )
+    cov = cov_table.df
+    
+    # Step 2: Filter to only active customers (event == 0)
+    active_customers = cov[cov["event"] == 0].copy()
+    
+    if len(active_customers) == 0:
+        return pd.DataFrame(columns=[
+            "customer_id", "t0", "X_days", "churn_probability",
+            "survival_at_t0", "survival_at_t0_plus_X"
+        ])
+    
+    # Step 3: Get covariate columns needed for model
+    covariate_cols = list(model.params_.index)
+    
+    # Create log transformations if needed
+    if 'log_monetary_value' in covariate_cols and 'monetary_value' in active_customers.columns:
+        active_customers['log_monetary_value'] = np.log1p(active_customers['monetary_value'])
+    
+    if 'log_product_diversity' in covariate_cols and 'product_diversity' in active_customers.columns:
+        active_customers['log_product_diversity'] = np.log1p(active_customers['product_diversity'])
+    
+    # Verify we have all required covariates
+    missing_cols = [col for col in covariate_cols if col not in active_customers.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required covariates: {missing_cols}")
+    
+    # Drop rows with missing values in covariates
+    active_customers = active_customers.dropna(subset=covariate_cols)
+    
+    # Helper function to interpolate survival at time t
+    def survival_at(sf, t):
+        """Interpolate survival function at time t."""
+        if t <= sf.index.min():
+            return float(sf.iloc[0])
+        elif t >= sf.index.max():
+            return float(sf.iloc[-1])
+        else:
+            return float(np.interp(t, sf.index.values, sf.values))
+    
+    # Step 4: Compute conditional churn probability for each active customer
+    results = []
+    
+    for idx, row in active_customers.iterrows():
+        customer_id = row["customer_id"]
+        t0 = row["tenure_days"]  # Current duration at cutoff
+        
+        # Get covariates for this customer (as DataFrame with single row)
+        X_df = pd.DataFrame([row[covariate_cols]], columns=covariate_cols)
+        
+        # Get individual survival curve
+        # Returns DataFrame with time as index, one column per customer
+        sf = model.predict_survival_function(X_df)
+        
+        # Extract survival curve (first column, as Series with time index)
+        sf_series = sf.iloc[:, 0]  # Series with time index
+        
+        # Read survival at t0 and t0 + X_days
+        s_t0 = survival_at(sf_series, t0)
+        s_t1 = survival_at(sf_series, t0 + X_days)
+        
+        # Step 5: Compute conditional churn probability
+        # P(churn in next X | survived to t0) = 1 - S(t0 + X) / S(t0)
+        if s_t0 > 0:
+            p_churn = 1.0 - (s_t1 / s_t0)
+            # Clamp to [0, 1] for numerical stability
+            p_churn = max(0.0, min(1.0, p_churn))
+        else:
+            # If survival at t0 is 0, customer has already churned (shouldn't happen for event=0)
+            p_churn = 1.0
+        
+        results.append({
+            "customer_id": customer_id,
+            "t0": float(t0),
+            "X_days": X_days,
+            "churn_probability": p_churn,
+            "survival_at_t0": s_t0,
+            "survival_at_t0_plus_X": s_t1,
+        })
+    
+    result_df = pd.DataFrame(results)
+    
+    # Sort by churn probability descending (highest risk first)
+    result_df = result_df.sort_values("churn_probability", ascending=False).reset_index(drop=True)
+    
+    return result_df

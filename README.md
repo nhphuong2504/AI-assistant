@@ -97,3 +97,10 @@ Cox-baseline:
         -> Change frequency_rate to n_orders for simpler to explain and avoid tenure day -> same results -> good
         -> improve monetary by log -> good sign now
         -> drop is_uk
+
+Rank customer -> solid
+
+Q: Given that the customer has survived (not churned) up to today, what is the probability they will churn in the next X days?
+
+Compute conditional churn probability using
+1 − S(t0+X|x) / S(t0|x) for active customers only, where t0 is tenure at cutoff and S(t|x) comes from predict_survival_function.

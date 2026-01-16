@@ -8,6 +8,9 @@ from analytics.clv import build_rfm, fit_models, predict_clv
 from analytics.survival import (
     build_covariate_table,
     fit_km_all,
+    fit_cox_baseline,
+    score_customers,
+    predict_churn_probability,
     CUTOFF_DATE,
     INACTIVITY_DAYS,
 )
@@ -59,6 +62,23 @@ class KMResponse(BaseModel):
     n_customers: int
     churn_rate: float
     survival_curve: List[Dict[str, float]]
+
+
+class ScoreCustomersResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    n_customers: int
+    scored_customers: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+
+class ChurnProbabilityResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    X_days: int
+    n_customers: int
+    predictions: List[Dict[str, Any]]
+    summary: Dict[str, Any]
 
 
 
@@ -199,5 +219,127 @@ def km_all(inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity
         n_customers=len(cov),
         churn_rate=float(cov["event"].mean()),
         survival_curve=curve,
+    )
+
+
+@app.post("/survival/score", response_model=ScoreCustomersResponse)
+def score_customers_endpoint(
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for scoring (YYYY-MM-DD)"),
+) -> ScoreCustomersResponse:
+    """
+    Score customers using a fitted Cox model to predict churn risk.
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    # Build covariate table for model fitting
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+    ).df
+
+    # Fit Cox model with standard covariates
+    cox_result = fit_cox_baseline(
+        covariates=cov,
+        covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+        train_frac=0.8,
+        random_state=42,
+        penalizer=0.1,
+    )
+    cox_model = cox_result['model']
+
+    # Score customers
+    scored = score_customers(
+        model=cox_model,
+        transactions=df,
+        cutoff_date=cutoff_date,
+    )
+
+    # Create summary
+    summary = {
+        "n_customers": int(len(scored)),
+        "risk_score_mean": float(scored["risk_score"].mean()),
+        "risk_score_max": float(scored["risk_score"].max()),
+        "risk_bucket_counts": scored["risk_bucket"].value_counts().to_dict(),
+    }
+
+    return ScoreCustomersResponse(
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+        n_customers=len(scored),
+        scored_customers=scored.to_dict(orient="records"),
+        summary=summary,
+    )
+
+
+@app.post("/survival/churn-probability", response_model=ChurnProbabilityResponse)
+def churn_probability_endpoint(
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for prediction (YYYY-MM-DD)"),
+    X_days: int = Query(90, ge=1, le=3650, description="Prediction horizon in days"),
+) -> ChurnProbabilityResponse:
+    """
+    Predict conditional churn probability for active customers.
+    Computes P(churn in next X days | survived to cutoff).
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    # Build covariate table for model fitting
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+    ).df
+
+    # Fit Cox model with standard covariates
+    cox_result = fit_cox_baseline(
+        covariates=cov,
+        covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+        train_frac=0.8,
+        random_state=42,
+        penalizer=0.1,
+    )
+    cox_model = cox_result['model']
+
+    # Predict churn probabilities
+    predictions = predict_churn_probability(
+        model=cox_model,
+        transactions=df,
+        cutoff_date=cutoff_date,
+        X_days=X_days,
+        inactivity_days=inactivity_days,
+    )
+
+    # Create summary
+    summary = {
+        "n_customers": int(len(predictions)),
+        "churn_probability_mean": float(predictions["churn_probability"].mean()),
+        "churn_probability_median": float(predictions["churn_probability"].median()),
+        "churn_probability_max": float(predictions["churn_probability"].max()),
+        "churn_probability_min": float(predictions["churn_probability"].min()),
+        "survival_at_t0_mean": float(predictions["survival_at_t0"].mean()),
+        "survival_at_t0_plus_X_mean": float(predictions["survival_at_t0_plus_X"].mean()),
+    }
+
+    return ChurnProbabilityResponse(
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+        X_days=X_days,
+        n_customers=len(predictions),
+        predictions=predictions.to_dict(orient="records"),
+        summary=summary,
     )
 

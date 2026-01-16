@@ -149,4 +149,114 @@ with tab5:
             )
             st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("## Customer Risk Scoring (Cox Model)")
+
+    if st.button("Score Customers"):
+        with st.spinner("Fitting Cox model and scoring customers..."):
+            r = requests.post(
+                f"{API_URL}/survival/score?inactivity_days=90",
+                timeout=300,
+            )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
+            st.write(f"N customers: {payload['n_customers']}")
+
+            # Display summary
+            summary = payload['summary']
+            st.markdown("### Summary")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("Total Customers", summary['n_customers'])
+            with col2:
+                st.metric("Mean Risk Score", f"{summary['risk_score_mean']:.3f}")
+            with col3:
+                st.metric("Max Risk Score", f"{summary['risk_score_max']:.3f}")
+
+            # Risk bucket distribution
+            st.markdown("### Risk Bucket Distribution")
+            bucket_counts = summary['risk_bucket_counts']
+            bucket_df = pd.DataFrame({
+                'Risk Bucket': list(bucket_counts.keys()),
+                'Count': list(bucket_counts.values())
+            })
+            st.dataframe(bucket_df, use_container_width=True)
+
+            # Display scored customers
+            df = pd.DataFrame(payload['scored_customers'])
+            st.markdown("### Scored Customers")
+            st.dataframe(df, use_container_width=True)
+
+            # Charts
+            if len(df) > 0:
+                st.markdown("### Risk Score Distribution")
+                fig = px.histogram(df, x="risk_score", nbins=50, title="Distribution of Risk Scores")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("### Risk Percentile vs Risk Score")
+                fig = px.scatter(df, x="risk_percentile", y="risk_score", 
+                               color="risk_bucket", 
+                               title="Risk Percentile vs Risk Score",
+                               labels={"risk_percentile": "Risk Percentile", "risk_score": "Risk Score"})
+                st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("## Churn Probability Prediction (Cox Model)")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        X_days = st.slider("Prediction horizon (days)", 7, 365, 90, help="Probability of churn in the next X days")
+    
+    if st.button("Predict Churn Probability"):
+        with st.spinner("Fitting Cox model and predicting churn probabilities..."):
+            r = requests.post(
+                f"{API_URL}/survival/churn-probability?inactivity_days=90&X_days={X_days}",
+                timeout=300,
+            )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']} | Horizon: {payload['X_days']} days")
+            st.write(f"N active customers: {payload['n_customers']}")
+
+            # Display summary
+            summary = payload['summary']
+            st.markdown("### Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Customers", summary['n_customers'])
+            with col2:
+                st.metric("Mean Churn Prob", f"{summary['churn_probability_mean']:.3f}")
+            with col3:
+                st.metric("Median Churn Prob", f"{summary['churn_probability_median']:.3f}")
+            with col4:
+                st.metric("Max Churn Prob", f"{summary['churn_probability_max']:.3f}")
+
+            # Display predictions
+            df = pd.DataFrame(payload['predictions'])
+            st.markdown("### Churn Probability Predictions")
+            st.dataframe(df, use_container_width=True)
+
+            # Charts
+            if len(df) > 0:
+                st.markdown("### Churn Probability Distribution")
+                fig = px.histogram(df, x="churn_probability", nbins=50, 
+                                 title=f"Distribution of Churn Probabilities (next {X_days} days)")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("### Churn Probability vs Current Duration (t0)")
+                fig = px.scatter(df, x="t0", y="churn_probability", 
+                               title=f"Churn Probability vs Current Duration (next {X_days} days)",
+                               labels={"t0": "Current Duration (days)", "churn_probability": "Churn Probability"})
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("### Survival Probabilities")
+                fig = px.scatter(df, x="survival_at_t0", y="survival_at_t0_plus_X",
+                               title="Survival at t0 vs Survival at t0+X",
+                               labels={"survival_at_t0": "Survival at t0", 
+                                      "survival_at_t0_plus_X": "Survival at t0+X"})
+                st.plotly_chart(fig, use_container_width=True)
+
 
