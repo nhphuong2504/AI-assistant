@@ -189,18 +189,20 @@ def clv(req: CLVRequest) -> CLVResponse:
 
     pred = pred.sort_values("clv", ascending=False)
 
-    top = pred.head(50)[["customer_id", "frequency", "recency", "T", "monetary_value", "pred_purchases", "pred_aov", "clv"]]
+    # Return all customers (or up to limit_customers if less than total)
+    customer_limit = min(req.limit_customers, len(pred))
+    all_customers = pred.head(customer_limit)[["customer_id", "frequency", "recency", "T", "monetary_value", "pred_purchases", "pred_aov", "clv"]]
     summary = {
-    "customers_total": int(len(pred)),
-    "customers_with_repeat": int((pred["frequency"] > 0).sum()),
-    "clv_mean": float(pred["clv"].mean(skipna=True)) if len(pred) > 0 else 0.0,  # Mean of all customers
-    "clv_max": float(top["clv"].max()) if len(top) else 0.0,
-}
+        "customers_total": int(len(pred)),
+        "customers_with_repeat": int((pred["frequency"] > 0).sum()),
+        "clv_mean": float(pred["clv"].mean(skipna=True)) if len(pred) > 0 else 0.0,  # Mean of all customers
+        "clv_max": float(all_customers["clv"].max()) if len(all_customers) > 0 else 0.0,
+    }
 
     return CLVResponse(
         cutoff_date=req.cutoff_date,
         horizon_days=req.horizon_days,
-        top_customers=top.to_dict(orient="records"),
+        top_customers=all_customers.to_dict(orient="records"),
         summary=summary,
     )
 

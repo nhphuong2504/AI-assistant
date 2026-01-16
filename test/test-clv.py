@@ -20,7 +20,7 @@ def test_build_rfm_basic():
     })
     
     cutoff_date = "2023-03-01"
-    rfm = build_rfm(transactions, cutoff_date)
+    rfm = build_rfm(transactions, cutoff_date, cap_percentile=100)  # No capping for test
     
     # Check structure
     assert isinstance(rfm, pd.DataFrame)
@@ -79,7 +79,7 @@ def test_build_rfm_cutoff_date():
     })
     
     cutoff_date = "2023-02-01"
-    rfm = build_rfm(transactions, cutoff_date)
+    rfm = build_rfm(transactions, cutoff_date, cap_percentile=100)  # No capping for test
     
     # Should only count I1 and I2 (I3 is after cutoff)
     c1 = rfm.loc["C1"]
@@ -118,7 +118,7 @@ def test_build_rfm_multiple_items_per_invoice():
     })
     
     cutoff_date = "2023-03-01"
-    rfm = build_rfm(transactions, cutoff_date)
+    rfm = build_rfm(transactions, cutoff_date, cap_percentile=100)  # No capping for test
     
     c1 = rfm.loc["C1"]
     assert c1["frequency"] == 1.0  # 2 invoices - 1 = 1
@@ -838,4 +838,214 @@ if __name__ == "__main__":
             print(f"\n✓ All {segment_name} segments have reasonable pred/actual ratios (0.5-2.0)")
     
     print("\n✅ CLV calibration flow completed!")
+    
+    # ========================================================================
+    # MULTIPLE TRAIN/TEST SPLITS TO PICK BEST SCALE VALUES
+    # ========================================================================
+    print("\n" + "="*60)
+    print("MULTIPLE TRAIN/TEST SPLITS - FINDING BEST SCALE VALUES")
+    print("="*60)
+    
+    # Define multiple train/test cutoff date combinations
+    # Test different split points to find robust scale values
+    split_configs = [
+        {"train_cutoff": "2011-08-09", "test_cutoff": "2011-11-09", "horizon_days": 92},  # ~3 months
+        {"train_cutoff": "2011-09-09", "test_cutoff": "2011-12-09", "horizon_days": 91},  # ~3 months (original)
+        {"train_cutoff": "2011-07-09", "test_cutoff": "2011-10-09", "horizon_days": 92},  # ~3 months
+        {"train_cutoff": "2011-06-09", "test_cutoff": "2011-09-09", "horizon_days": 92},  # ~3 months
+        {"train_cutoff": "2011-08-09", "test_cutoff": "2011-10-09", "horizon_days": 61},  # ~2 months
+        {"train_cutoff": "2011-09-09", "test_cutoff": "2011-11-09", "horizon_days": 61},  # ~2 months
+    ]
+    
+    print(f"\nTesting {len(split_configs)} different train/test split configurations...")
+    
+    scale_results = []
+    
+    for i, config in enumerate(split_configs, 1):
+        train_cutoff = config["train_cutoff"]
+        test_cutoff = config["test_cutoff"]
+        horizon_days = config["horizon_days"]
+        
+        print(f"\n--- Split {i}/{len(split_configs)}: Train={train_cutoff}, Test={test_cutoff} ({horizon_days} days) ---")
+        
+        try:
+            # Build RFM for training period
+            rfm_train_split = build_rfm(df, train_cutoff)
+            
+            if len(rfm_train_split) < 100:  # Skip if too few customers
+                print(f"  ⚠ Skipped: Too few training customers ({len(rfm_train_split)})")
+                continue
+            
+            # Fit models
+            clv_train_split = fit_models(rfm_train_split)
+            
+            # Calculate actual values in test period
+            df_test_split = df.copy()
+            df_test_split["invoice_date"] = pd.to_datetime(df_test_split["invoice_date"])
+            train_cutoff_dt = pd.to_datetime(train_cutoff)
+            test_cutoff_dt = pd.to_datetime(test_cutoff)
+            
+            test_transactions_split = df_test_split[
+                (df_test_split["invoice_date"] > train_cutoff_dt) & 
+                (df_test_split["invoice_date"] <= test_cutoff_dt)
+            ].copy()
+            
+            if len(test_transactions_split) == 0:
+                print(f"  ⚠ Skipped: No test period transactions")
+                continue
+            
+            # Aggregate test period data
+            test_orders_split = (
+                test_transactions_split.groupby(["customer_id", "invoice_no"], as_index=False)
+                .agg(
+                    order_date=("invoice_date", "min"),
+                    order_value=("revenue", "sum"),
+                )
+            )
+            
+            test_customer_stats_split = test_orders_split.groupby("customer_id", as_index=True).agg(
+                actual_purchases=("invoice_no", "nunique"),
+                actual_aov=("order_value", "mean"),
+            )
+            
+            test_customer_stats_split = test_customer_stats_split.reindex(rfm_train_split.index, fill_value=0)
+            test_customer_stats_split["actual_purchases"] = test_customer_stats_split["actual_purchases"].fillna(0)
+            test_customer_stats_split["actual_aov"] = test_customer_stats_split["actual_aov"].fillna(np.nan)
+            
+            # Predict unscaled CLV
+            clv_unscaled_split = predict_clv(
+                clv_train_split,
+                horizon_days=horizon_days,
+                scale_to_target_purchases=None,
+                scale_to_target_revenue=None,
+                aov_fallback="global_mean"
+            )
+            
+            # Calculate actual vs predicted totals
+            actual_total_purchases_split = test_customer_stats_split["actual_purchases"].sum()
+            actual_total_revenue_split = test_transactions_split["revenue"].sum()
+            
+            pred_total_purchases_split = clv_unscaled_split["pred_purchases"].sum()
+            pred_total_revenue_split = clv_unscaled_split["clv"].sum(skipna=True)
+            
+            # Calculate scales
+            purchase_scale_split = actual_total_purchases_split / pred_total_purchases_split if pred_total_purchases_split > 0 else 1.0
+            revenue_scale_split = actual_total_revenue_split / pred_total_revenue_split if pred_total_revenue_split > 0 else 1.0
+            
+            # Evaluate scaled predictions
+            clv_scaled_split = predict_clv(
+                clv_train_split,
+                horizon_days=horizon_days,
+                scale_to_target_purchases=actual_total_purchases_split,
+                scale_to_target_revenue=actual_total_revenue_split,
+                aov_fallback="global_mean"
+            )
+            
+            # Calculate evaluation metrics
+            customer_actual_revenue_split = test_transactions_split.groupby("customer_id")["revenue"].sum().reset_index(name="actual_revenue")
+            
+            clv_eval_split = clv_scaled_split.merge(
+                test_customer_stats_split.reset_index(),
+                on="customer_id",
+                how="left"
+            ).merge(
+                customer_actual_revenue_split,
+                on="customer_id",
+                how="left"
+            )
+            clv_eval_split["actual_revenue"] = clv_eval_split["actual_revenue"].fillna(0)
+            
+            # Purchase metrics
+            purchase_eval_split = clv_eval_split.dropna(subset=["pred_purchases", "actual_purchases"])
+            purchase_mae_split = np.mean(np.abs(purchase_eval_split["pred_purchases"] - purchase_eval_split["actual_purchases"])) if len(purchase_eval_split) > 0 else np.nan
+            purchase_rmse_split = np.sqrt(np.mean((purchase_eval_split["pred_purchases"] - purchase_eval_split["actual_purchases"])**2)) if len(purchase_eval_split) > 0 else np.nan
+            
+            # Revenue metrics
+            revenue_eval_split = clv_eval_split[
+                (clv_eval_split["clv"].notna()) & 
+                (clv_eval_split["actual_revenue"] > 0)
+            ]
+            revenue_mae_split = np.mean(np.abs(revenue_eval_split["clv"] - revenue_eval_split["actual_revenue"])) if len(revenue_eval_split) > 0 else np.nan
+            revenue_rmse_split = np.sqrt(np.mean((revenue_eval_split["clv"] - revenue_eval_split["actual_revenue"])**2)) if len(revenue_eval_split) > 0 else np.nan
+            
+            # Store results
+            result = {
+                "train_cutoff": train_cutoff,
+                "test_cutoff": test_cutoff,
+                "horizon_days": horizon_days,
+                "n_train_customers": len(rfm_train_split),
+                "n_test_customers": len(test_customer_stats_split[test_customer_stats_split["actual_purchases"] > 0]),
+                "purchase_scale": purchase_scale_split,
+                "revenue_scale": revenue_scale_split,
+                "purchase_mae": purchase_mae_split,
+                "purchase_rmse": purchase_rmse_split,
+                "revenue_mae": revenue_mae_split,
+                "revenue_rmse": revenue_rmse_split,
+                "actual_total_purchases": actual_total_purchases_split,
+                "actual_total_revenue": actual_total_revenue_split,
+            }
+            
+            scale_results.append(result)
+            
+            print(f"  ✓ Purchase scale: {purchase_scale_split:.6f}")
+            print(f"  ✓ Revenue scale: {revenue_scale_split:.6f}")
+            print(f"  ✓ Purchase MAE: {purchase_mae_split:.4f}, RMSE: {purchase_rmse_split:.4f}")
+            print(f"  ✓ Revenue MAE: ${revenue_mae_split:,.2f}, RMSE: ${revenue_rmse_split:,.2f}")
+            
+        except Exception as e:
+            print(f"  ✗ Error: {str(e)}")
+            continue
+    
+    if len(scale_results) == 0:
+        print("\n⚠ No valid split configurations found")
+    else:
+        # Convert to DataFrame for analysis
+        scale_df = pd.DataFrame(scale_results)
+        
+        print(f"\n--- Summary of All Splits ---")
+        print(scale_df[["train_cutoff", "test_cutoff", "purchase_scale", "revenue_scale", 
+                       "purchase_mae", "revenue_mae"]].to_string(index=False))
+        
+        # Analyze scale values
+        print(f"\n--- Scale Value Statistics ---")
+        print(f"Purchase scale - Mean: {scale_df['purchase_scale'].mean():.6f}, Std: {scale_df['purchase_scale'].std():.6f}")
+        print(f"Purchase scale - Min: {scale_df['purchase_scale'].min():.6f}, Max: {scale_df['purchase_scale'].max():.6f}")
+        print(f"Revenue scale - Mean: {scale_df['revenue_scale'].mean():.6f}, Std: {scale_df['revenue_scale'].std():.6f}")
+        print(f"Revenue scale - Min: {scale_df['revenue_scale'].min():.6f}, Max: {scale_df['revenue_scale'].max():.6f}")
+        
+        # Find best split based on combined error metric (lower is better)
+        # Use normalized MAE (MAE / mean actual value) to compare across splits
+        scale_df["combined_error"] = (
+            scale_df["purchase_mae"] / (scale_df["actual_total_purchases"] / scale_df["n_test_customers"] + 1e-10) +
+            scale_df["revenue_mae"] / (scale_df["actual_total_revenue"] / scale_df["n_test_customers"] + 1e-10)
+        )
+        
+        best_idx = scale_df["combined_error"].idxmin()
+        best_split = scale_df.loc[best_idx]
+        
+        print(f"\n--- Best Split (Lowest Combined Error) ---")
+        print(f"Train cutoff: {best_split['train_cutoff']}")
+        print(f"Test cutoff: {best_split['test_cutoff']}")
+        print(f"Horizon: {best_split['horizon_days']} days")
+        print(f"Purchase scale: {best_split['purchase_scale']:.6f}")
+        print(f"Revenue scale: {best_split['revenue_scale']:.6f}")
+        print(f"Purchase MAE: {best_split['purchase_mae']:.4f}")
+        print(f"Revenue MAE: ${best_split['revenue_mae']:,.2f}")
+        
+        # Recommend using mean scales for robustness, or best split scales
+        mean_purchase_scale = scale_df["purchase_scale"].mean()
+        mean_revenue_scale = scale_df["revenue_scale"].mean()
+        
+        print(f"\n--- Recommended Scale Values ---")
+        print(f"Option 1: Use mean scales (most robust across splits):")
+        print(f"  PURCHASE_SCALE = {mean_purchase_scale:.10f}")
+        print(f"  REVENUE_SCALE = {mean_revenue_scale:.10f}")
+        print(f"\nOption 2: Use best split scales (lowest error):")
+        print(f"  PURCHASE_SCALE = {best_split['purchase_scale']:.10f}")
+        print(f"  REVENUE_SCALE = {best_split['revenue_scale']:.10f}")
+        print(f"\nOption 3: Use median scales (robust to outliers):")
+        print(f"  PURCHASE_SCALE = {scale_df['purchase_scale'].median():.10f}")
+        print(f"  REVENUE_SCALE = {scale_df['revenue_scale'].median():.10f}")
+        
+        print("\n✅ Multiple split analysis completed!")
 

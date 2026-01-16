@@ -14,8 +14,8 @@ from lifetimes import BetaGeoFitter, GammaGammaFitter
 # These values are derived from calibration on train cutoff 2011-09-09, test cutoff 2011-12-09
 # Update these values after running test/test-clv.py calibration flow
 # To update: Run the test, copy the scale values from the output, and paste them here
-PURCHASE_SCALE = 1.373424  # Update with actual calibrated value from test output
-REVENUE_SCALE = 1.886953  # Update with actual calibrated value from test output
+PURCHASE_SCALE = 1.1  # Update with actual calibrated value from test output
+REVENUE_SCALE = 1.7  # Update with actual calibrated value from test output
 
 
 @dataclass
@@ -35,7 +35,7 @@ class CLVResult:
 def build_rfm(
     transactions: pd.DataFrame, 
     cutoff_date: str, 
-    cap_percentile: float = 99 
+    cap_percentile: float = 100 
 ) -> pd.DataFrame:
     """Build RFM (Recency, Frequency, Monetary) table from transaction data.
     
