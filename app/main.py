@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
 from app.llm import generate_sql
 import pandas as pd
-from analytics.clv import build_rfm, fit_models, predict_clv
+from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE
 from analytics.survival import (
     build_covariate_table,
     fit_km_all,
@@ -167,17 +167,35 @@ def clv(req: CLVRequest) -> CLVResponse:
 
     rfm = build_rfm(df, cutoff_date=req.cutoff_date)
     models = fit_models(rfm)
-    pred = predict_clv(models, horizon_days=req.horizon_days)
+    
+    # First get unscaled predictions to calculate target totals
+    pred_unscaled = predict_clv(models, horizon_days=req.horizon_days, aov_fallback="global_mean")
+    
+    # Calculate target totals using hard-coded scales
+    pred_total_purchases = pred_unscaled["pred_purchases"].sum()
+    pred_total_revenue = pred_unscaled["clv"].sum(skipna=True)
+    
+    target_purchases = pred_total_purchases * PURCHASE_SCALE if PURCHASE_SCALE != 1.0 else None
+    target_revenue = pred_total_revenue * REVENUE_SCALE if REVENUE_SCALE != 1.0 else None
+    
+    # Get scaled predictions
+    pred = predict_clv(
+        models, 
+        horizon_days=req.horizon_days,
+        scale_to_target_purchases=target_purchases,
+        scale_to_target_revenue=target_revenue,
+        aov_fallback="global_mean"
+    )
 
     pred = pred.sort_values("clv", ascending=False)
 
     top = pred.head(50)[["customer_id", "frequency", "recency", "T", "monetary_value", "pred_purchases", "pred_aov", "clv"]]
     summary = {
-        "customers_total": int(len(pred)),
-        "customers_with_repeat": int((pred["frequency"] > 0).sum()),
-        "clv_mean": float(top["clv"].mean()) if len(top) else 0.0,
-        "clv_max": float(top["clv"].max()) if len(top) else 0.0,
-    }
+    "customers_total": int(len(pred)),
+    "customers_with_repeat": int((pred["frequency"] > 0).sum()),
+    "clv_mean": float(pred["clv"].mean(skipna=True)) if len(pred) > 0 else 0.0,  # Mean of all customers
+    "clv_max": float(top["clv"].max()) if len(top) else 0.0,
+}
 
     return CLVResponse(
         cutoff_date=req.cutoff_date,

@@ -98,7 +98,7 @@ with tab3:
 with tab4:
     st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
 
-    cutoff = st.date_input("Cutoff date (calibration end)", value=pd.to_datetime("2011-09-30"))
+    cutoff = st.date_input("Cutoff date (calibration end)", value=pd.to_datetime("2011-12-09"))
     horizon = st.slider("CLV horizon (days)", 30, 365, 180)
 
     if st.button("Run CLV"):
