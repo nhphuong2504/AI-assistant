@@ -892,3 +892,251 @@ def predict_churn_probability(
     result_df = result_df.sort_values("churn_probability", ascending=False).reset_index(drop=True)
     
     return result_df
+
+
+def expected_remaining_lifetime(
+    model: CoxPHFitter,
+    covariates_df: pd.DataFrame,
+    H_days: int = 365,
+    inactivity_days: int = INACTIVITY_DAYS,
+) -> pd.DataFrame:
+    """
+    Computes restricted expected remaining lifetime for active customers.
+    
+    For each active customer (event == 0) with covariates x and current duration t0:
+    E[T - t0 | T > t0, x]_{≤H} = ∫[t0 to t0+H] S(u|x) / S(t0|x) du
+    
+    Where S(t|x) is the individual survival function from the Cox model.
+    
+    Args:
+        model: Fitted CoxPHFitter model (must NOT be refit)
+        covariates_df: DataFrame with customer_id, duration (or tenure_days), event, and all Cox covariates
+        H_days: Horizon in days for restricted expectation (default: 365)
+        inactivity_days: Inactivity days threshold (used for validation, default: 90)
+    
+    Returns:
+        DataFrame with columns:
+        - customer_id: Customer identifier
+        - t0: Current duration at cutoff
+        - H_days: Horizon used for computation
+        - expected_remaining_life_days: Restricted expected remaining lifetime in days
+    """
+    # Helper function for numerical integration
+    def expected_remaining_life(sf, t0, H_days, eps=1e-12):
+        """Compute restricted expected remaining lifetime using numerical integration."""
+        t_grid = sf.index.values.astype(float)
+        S_grid = sf.values[:, 0].astype(float)
+
+        t_max = min(t0 + H_days, t_grid.max())
+        if t0 >= t_max or t0 > t_grid.max():
+            return 0.0
+
+        S_t0 = float(np.interp(t0, t_grid, S_grid))
+        if S_t0 <= eps:
+            return 0.0
+
+        S_tmax = float(np.interp(t_max, t_grid, S_grid))
+
+        mask = (t_grid > t0) & (t_grid < t_max)
+        t_inner = t_grid[mask]
+        S_inner = S_grid[mask]
+
+        t_all = np.concatenate(([t0], t_inner, [t_max]))
+        S_all = np.concatenate(([S_t0], S_inner, [S_tmax]))
+
+        S_cond = S_all / S_t0
+        return float(np.trapezoid(S_cond, t_all))
+
+    
+    # Step 1: Filter to active customers (event == 0)
+    active_customers = covariates_df[covariates_df["event"] == 0].copy()
+    
+    if len(active_customers) == 0:
+        return pd.DataFrame(columns=[
+            "customer_id", "t0", "H_days", "expected_remaining_life_days"
+        ])
+    
+    # Step 2: Get covariate columns needed for model
+    covariate_cols = list(model.params_.index)
+    
+    # Create log transformations if needed
+    if 'log_monetary_value' in covariate_cols and 'monetary_value' in active_customers.columns:
+        active_customers['log_monetary_value'] = np.log1p(active_customers['monetary_value'])
+    
+    if 'log_product_diversity' in covariate_cols and 'product_diversity' in active_customers.columns:
+        active_customers['log_product_diversity'] = np.log1p(active_customers['product_diversity'])
+    
+    # Verify we have all required covariates
+    missing_cols = [col for col in covariate_cols if col not in active_customers.columns]
+    if missing_cols:
+        raise ValueError(f"Missing required covariates: {missing_cols}")
+    
+    # Drop rows with missing values in covariates
+    active_customers = active_customers.dropna(subset=covariate_cols)
+    
+    # Determine t0 column (duration or tenure_days)
+    if 'duration' in active_customers.columns:
+        t0_col = 'duration'
+    elif 'tenure_days' in active_customers.columns:
+        t0_col = 'tenure_days'
+    else:
+        raise ValueError("covariates_df must contain either 'duration' or 'tenure_days' column")
+    
+    # Step 3: Compute expected remaining lifetime for each active customer
+    results = []
+    
+    for idx, row in active_customers.iterrows():
+        customer_id = row["customer_id"]
+        t0 = row[t0_col]  # Current duration at cutoff
+        
+        # Extract covariates for this customer (as DataFrame with single row)
+        X_row = pd.DataFrame([row[covariate_cols]], columns=covariate_cols)
+        
+        # Get individual survival curve
+        # Returns DataFrame with time as index, one column per customer
+        sf = model.predict_survival_function(X_row)
+        
+        # Compute expected remaining lifetime using numerical integration
+        expected_life = expected_remaining_life(sf, t0, H_days)
+        
+        # Validation: 0 ≤ expected_remaining_life_days ≤ H_days
+        expected_life = max(0.0, min(float(H_days), expected_life))
+        
+        results.append({
+            "customer_id": customer_id,
+            "t0": float(t0),
+            "H_days": H_days,
+            "expected_remaining_life_days": expected_life,
+        })
+    
+    result_df = pd.DataFrame(results)
+    
+    # Sort by expected_remaining_life_days descending (longest expected life first)
+    result_df = result_df.sort_values("expected_remaining_life_days", ascending=False).reset_index(drop=True)
+    
+    return result_df
+
+
+def build_segmentation_table(
+    model: CoxPHFitter,
+    transactions: pd.DataFrame,
+    covariates_df: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
+    H_days: int = 365,
+) -> Tuple[pd.DataFrame, Dict[str, float]]:
+    """
+    Builds final segmentation table combining risk labels and expected remaining lifetime.
+    
+    Segments active customers based on:
+    - Risk label (High/Medium/Low) from score_customers
+    - Expected remaining lifetime bucket (Short/Medium/Long) based on quantiles
+    - Provides action tags and recommended actions for each segment
+    
+    Args:
+        model: Fitted CoxPHFitter model (must NOT be refit)
+        transactions: DataFrame with customer_id, invoice_no, invoice_date, revenue, stock_code
+        covariates_df: DataFrame with customer_id, event, duration (or tenure_days), and Cox covariates
+        cutoff_date: Cutoff date for scoring (YYYY-MM-DD)
+        H_days: Horizon for expected remaining lifetime (default: 365)
+    
+    Returns:
+        Tuple of:
+        - final_df: DataFrame with columns:
+            customer_id, risk_label, t0, erl_365_days, life_bucket, segment, action_tag, recommended_action
+        - cutoffs: Dictionary with q33, q67, H_days
+    """
+    # Step 1: Compute risk labels using score_customers
+    df_scores = score_customers(
+        model=model,
+        transactions=transactions,
+        cutoff_date=cutoff_date,
+    )
+    
+    # Extract risk_label from risk_bucket
+    df_scores = df_scores[['customer_id', 'risk_bucket']].copy()
+    df_scores.rename(columns={'risk_bucket': 'risk_label'}, inplace=True)
+    
+    # Step 2: Compute ERL_365 for active customers
+    df_erl = expected_remaining_lifetime(
+        model=model,
+        covariates_df=covariates_df,
+        H_days=H_days,
+    )
+    
+    # Rename expected_remaining_life_days to erl_365_days
+    df_erl = df_erl.rename(columns={'expected_remaining_life_days': 'erl_365_days'})
+    
+    # Ensure only active customers (expected_remaining_lifetime already filters to event==0)
+    # But we'll do an inner join which naturally filters
+    
+    # Step 3: Join results
+    merged = df_erl.merge(
+        df_scores[['customer_id', 'risk_label']],
+        on='customer_id',
+        how='inner'
+    )
+    
+    # Step 4: Create ERL life_bucket based on quantiles
+    q33 = merged['erl_365_days'].quantile(0.33)
+    q67 = merged['erl_365_days'].quantile(0.67)
+    
+    def assign_life_bucket(erl):
+        if erl < q33:
+            return "Short"
+        elif erl < q67:
+            return "Medium"
+        else:
+            return "Long"
+    
+    merged['life_bucket'] = merged['erl_365_days'].apply(assign_life_bucket)
+    
+    # Step 5: Build segment and actions
+    merged['segment'] = merged['risk_label'] + "-" + merged['life_bucket']
+    
+    # Action mapping
+    action_map = {
+        'High-Long': ('Priority Save', 'High-touch retention; targeted offers; outreach.'),
+        'High-Medium': ('Save', 'Retention campaign; incentives; reminders.'),
+        'High-Short': ('Let Churn', 'Low ROI; automated nudges only.'),
+        'Medium-Long': ('Growth Retain', 'Nurture + selective offers; reduce friction.'),
+        'Medium-Medium': ('Nurture', 'Light engagement; test offers.'),
+        'Medium-Short': ('Monitor', 'Monitor; minimal spend.'),
+        'Low-Long': ('VIP', 'Loyalty; upsell/cross-sell; premium support.'),
+        'Low-Medium': ('Maintain', 'Keep engaged; regular comms.'),
+        'Low-Short': ('Sunset', 'Minimal spend; cheap reactivation if any.'),
+    }
+    
+    def get_action(segment):
+        action_tag, recommended_action = action_map.get(segment, ('Unknown', 'No action defined.'))
+        return action_tag, recommended_action
+    
+    merged[['action_tag', 'recommended_action']] = merged['segment'].apply(
+        lambda s: pd.Series(get_action(s))
+    )
+    
+    # Step 6: Select and order output columns
+    final_df = merged[[
+        'customer_id',
+        'risk_label',
+        't0',
+        'erl_365_days',
+        'life_bucket',
+        'segment',
+        'action_tag',
+        'recommended_action'
+    ]].copy()
+    
+    # Sort by risk_label (High first) then by erl_365_days (descending)
+    risk_order = {'High': 0, 'Medium': 1, 'Low': 2}
+    final_df['_risk_order'] = final_df['risk_label'].map(risk_order)
+    final_df = final_df.sort_values(['_risk_order', 'erl_365_days'], ascending=[True, False])
+    final_df = final_df.drop(columns=['_risk_order']).reset_index(drop=True)
+    
+    # Return cutoffs metadata
+    cutoffs = {
+        'q33': float(q33),
+        'q67': float(q67),
+        'H_days': H_days,
+    }
+    
+    return final_df, cutoffs

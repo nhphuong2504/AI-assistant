@@ -99,7 +99,7 @@ with tab4:
     st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
 
     cutoff = st.date_input("Cutoff date (calibration end)", value=pd.to_datetime("2011-12-09"))
-    horizon = st.slider("CLV horizon (days)", 30, 365, 180)
+    horizon = st.slider("CLV horizon (days)", 30, 365, 90)
 
     if st.button("Run CLV"):
         r = requests.post(
@@ -258,5 +258,161 @@ with tab5:
                                labels={"survival_at_t0": "Survival at t0", 
                                       "survival_at_t0_plus_X": "Survival at t0+X"})
                 st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("## Expected Remaining Lifetime (Cox Model)")
+
+    col1 = st.columns(1)[0]
+    H_days = st.slider("Horizon (days)", 30, 1825, 365, help="Horizon for restricted expected remaining lifetime")
+    
+    if st.button("Compute Expected Lifetime"):
+        with st.spinner("Fitting Cox model and computing expected remaining lifetime..."):
+            r = requests.post(
+                f"{API_URL}/survival/expected-lifetime?inactivity_days=90&H_days={H_days}",
+                timeout=300,
+            )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']} | Horizon: {payload['H_days']} days")
+            st.write(f"N active customers: {payload['n_customers']}")
+
+            # Display summary
+            summary = payload['summary']
+            st.markdown("### Summary")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Customers", summary['n_customers'])
+            with col2:
+                st.metric("Mean Expected Lifetime", f"{summary['expected_lifetime_mean']:.2f} days")
+            with col3:
+                st.metric("Median Expected Lifetime", f"{summary['expected_lifetime_median']:.2f} days")
+            with col4:
+                st.metric("Max Expected Lifetime", f"{summary['expected_lifetime_max']:.2f} days")
+
+            # Display expected lifetimes
+            df = pd.DataFrame(payload['expected_lifetimes'])
+            st.markdown("### Expected Remaining Lifetime Predictions")
+            st.dataframe(df, use_container_width=True)
+
+            # Charts
+            if len(df) > 0:
+                st.markdown("### Expected Lifetime Distribution")
+                fig = px.histogram(df, x="expected_remaining_life_days", nbins=50, 
+                                 title=f"Distribution of Expected Remaining Lifetime (horizon: {H_days} days)")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("### Expected Lifetime vs Current Duration (t0)")
+                fig = px.scatter(df, x="t0", y="expected_remaining_life_days", 
+                               title=f"Expected Remaining Lifetime vs Current Duration (horizon: {H_days} days)",
+                               labels={"t0": "Current Duration (days)", 
+                                      "expected_remaining_life_days": "Expected Remaining Lifetime (days)"})
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Show relationship: customers with longer tenure should generally have lower expected remaining lifetime
+                # (they've already "used up" more of their lifetime)
+                st.markdown("### Expected Lifetime by Current Duration Bins")
+                bins = pd.cut(df['t0'], bins=10)
+                df['t0_bin'] = bins
+                df['t0_bin_center'] = df['t0_bin'].apply(lambda x: x.mid)
+                bin_stats = df.groupby('t0_bin_center')['expected_remaining_life_days'].agg(['mean', 'std', 'count']).reset_index()
+                fig = px.bar(bin_stats, x='t0_bin_center', y='mean',
+                           error_y='std',
+                           title="Mean Expected Remaining Lifetime by Current Duration",
+                           labels={"t0_bin_center": "Current Duration (days)", 
+                                  "mean": "Mean Expected Remaining Lifetime (days)"})
+                st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("## Customer Segmentation (Risk × Expected Lifetime)")
+
+    if st.button("Build Segmentation Table"):
+        with st.spinner("Building segmentation table..."):
+            r = requests.post(
+                f"{API_URL}/survival/segmentation?inactivity_days=90&H_days=365",
+                timeout=300,
+            )
+        if r.status_code != 200:
+            st.error(r.text)
+        else:
+            payload = r.json()
+            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']} | Horizon: {payload['H_days']} days")
+            st.write(f"N active customers: {payload['n_customers']}")
+
+            # Display cutoffs
+            cutoffs = payload['cutoffs']
+            st.markdown("### ERL Bucket Cutoffs")
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("33rd Percentile (q33)", f"{cutoffs['q33']:.2f} days")
+            with col2:
+                st.metric("67th Percentile (q67)", f"{cutoffs['q67']:.2f} days")
+            with col3:
+                st.metric("Horizon (H_days)", f"{cutoffs['H_days']} days")
+
+            # Display summary
+            summary = payload['summary']
+            st.markdown("### Summary")
+            col1, col2 = st.columns(2)
+            with col1:
+                st.metric("Total Customers", summary['n_customers'])
+                st.metric("Mean ERL", f"{summary['erl_mean']:.2f} days")
+            with col2:
+                st.metric("Median ERL", f"{summary['erl_median']:.2f} days")
+
+            # Segment distribution
+            st.markdown("### Segment Distribution")
+            df = pd.DataFrame(payload['segments'])
+            
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("**By Segment:**")
+                segment_counts = pd.Series(summary['segment_counts']).sort_index()
+                st.dataframe(segment_counts.reset_index().rename(columns={'index': 'Segment', 0: 'Count'}), use_container_width=True, hide_index=True)
+            
+            with col2:
+                st.markdown("**By Action Tag:**")
+                action_counts = pd.Series(summary['action_tag_counts']).sort_index()
+                st.dataframe(action_counts.reset_index().rename(columns={'index': 'Action Tag', 0: 'Count'}), use_container_width=True, hide_index=True)
+
+            # Display full segmentation table
+            st.markdown("### Full Segmentation Table")
+            st.dataframe(df, use_container_width=True)
+
+            # Charts
+            if len(df) > 0:
+                st.markdown("### Segment Distribution (Bar Chart)")
+                segment_counts = df['segment'].value_counts().sort_index()
+                fig = px.bar(x=segment_counts.index, y=segment_counts.values,
+                           title="Number of Customers by Segment",
+                           labels={"x": "Segment", "y": "Number of Customers"})
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("### Risk Label vs Life Bucket (Heatmap)")
+                pivot = pd.crosstab(df['risk_label'], df['life_bucket'])
+                fig = px.imshow(pivot.values, 
+                              labels=dict(x="Life Bucket", y="Risk Label", color="Count"),
+                              x=pivot.columns,
+                              y=pivot.index,
+                              title="Customer Count by Risk Label × Life Bucket",
+                              text_auto=True,
+                              aspect="auto")
+                st.plotly_chart(fig, use_container_width=True)
+
+                st.markdown("### ERL Distribution by Segment")
+                fig = px.box(df, x='segment', y='erl_365_days',
+                           title="Expected Remaining Lifetime Distribution by Segment",
+                           labels={"segment": "Segment", "erl_365_days": "Expected Remaining Lifetime (days)"})
+                fig.update_xaxes(tickangle=45)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Filter by segment
+                st.markdown("### Filter by Segment")
+                selected_segment = st.selectbox("Select segment to view details", 
+                                              options=sorted(df['segment'].unique()))
+                segment_df = df[df['segment'] == selected_segment]
+                st.write(f"**{len(segment_df)} customers in {selected_segment} segment**")
+                st.dataframe(segment_df[['customer_id', 'risk_label', 't0', 'erl_365_days', 
+                                       'life_bucket', 'action_tag', 'recommended_action']], 
+                           use_container_width=True)
 
 

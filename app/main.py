@@ -11,6 +11,8 @@ from analytics.survival import (
     fit_cox_baseline,
     score_customers,
     predict_churn_probability,
+    expected_remaining_lifetime,
+    build_segmentation_table,
     CUTOFF_DATE,
     INACTIVITY_DAYS,
 )
@@ -78,6 +80,25 @@ class ChurnProbabilityResponse(BaseModel):
     X_days: int
     n_customers: int
     predictions: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+
+class ExpectedLifetimeResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    H_days: int
+    n_customers: int
+    expected_lifetimes: List[Dict[str, Any]]
+    summary: Dict[str, Any]
+
+
+class SegmentationResponse(BaseModel):
+    cutoff_date: str
+    inactivity_days: int
+    H_days: int
+    n_customers: int
+    segments: List[Dict[str, Any]]
+    cutoffs: Dict[str, float]
     summary: Dict[str, Any]
 
 
@@ -360,6 +381,133 @@ def churn_probability_endpoint(
         X_days=X_days,
         n_customers=len(predictions),
         predictions=predictions.to_dict(orient="records"),
+        summary=summary,
+    )
+
+
+@app.post("/survival/expected-lifetime", response_model=ExpectedLifetimeResponse)
+def expected_lifetime_endpoint(
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for computation (YYYY-MM-DD)"),
+    H_days: int = Query(365, ge=1, le=3650, description="Horizon in days for restricted expectation"),
+) -> ExpectedLifetimeResponse:
+    """
+    Compute restricted expected remaining lifetime for active customers.
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    # Build covariate table for model fitting
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+    ).df
+
+    # Fit Cox model with standard covariates
+    cox_result = fit_cox_baseline(
+        covariates=cov,
+        covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+        train_frac=0.8,
+        random_state=42,
+        penalizer=0.1,
+    )
+    cox_model = cox_result['model']
+
+    # Compute expected remaining lifetime
+    expected_lifetimes = expected_remaining_lifetime(
+        model=cox_model,
+        covariates_df=cov,
+        H_days=H_days,
+        inactivity_days=inactivity_days,
+    )
+
+    # Create summary
+    summary = {
+        "n_customers": int(len(expected_lifetimes)),
+        "expected_lifetime_mean": float(expected_lifetimes["expected_remaining_life_days"].mean()),
+        "expected_lifetime_median": float(expected_lifetimes["expected_remaining_life_days"].median()),
+        "expected_lifetime_max": float(expected_lifetimes["expected_remaining_life_days"].max()),
+        "expected_lifetime_min": float(expected_lifetimes["expected_remaining_life_days"].min()),
+        "t0_mean": float(expected_lifetimes["t0"].mean()),
+    }
+
+    return ExpectedLifetimeResponse(
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+        H_days=H_days,
+        n_customers=len(expected_lifetimes),
+        expected_lifetimes=expected_lifetimes.to_dict(orient="records"),
+        summary=summary,
+    )
+
+
+@app.post("/survival/segmentation", response_model=SegmentationResponse)
+def segmentation_endpoint(
+    inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for segmentation (YYYY-MM-DD)"),
+    H_days: int = Query(365, ge=1, le=3650, description="Horizon in days for expected remaining lifetime"),
+) -> SegmentationResponse:
+    """
+    Build segmentation table combining risk labels and expected remaining lifetime.
+    """
+    sql = """
+    SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+    FROM transactions
+    WHERE customer_id IS NOT NULL
+    """
+    rows, _ = run_query_internal(sql, max_rows=2_000_000)
+    df = pd.DataFrame(rows)
+
+    # Build covariate table
+    cov = build_covariate_table(
+        transactions=df,
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+    ).df
+
+    # Fit Cox model with standard covariates
+    cox_result = fit_cox_baseline(
+        covariates=cov,
+        covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+        train_frac=0.8,
+        random_state=42,
+        penalizer=0.1,
+    )
+    cox_model = cox_result['model']
+
+    # Build segmentation table
+    segmentation_df, cutoffs = build_segmentation_table(
+        model=cox_model,
+        transactions=df,
+        covariates_df=cov,
+        cutoff_date=cutoff_date,
+        H_days=H_days,
+    )
+
+    # Create summary
+    summary = {
+        "n_customers": int(len(segmentation_df)),
+        "segment_counts": segmentation_df['segment'].value_counts().to_dict(),
+        "risk_label_counts": segmentation_df['risk_label'].value_counts().to_dict(),
+        "life_bucket_counts": segmentation_df['life_bucket'].value_counts().to_dict(),
+        "action_tag_counts": segmentation_df['action_tag'].value_counts().to_dict(),
+        "erl_mean": float(segmentation_df['erl_365_days'].mean()),
+        "erl_median": float(segmentation_df['erl_365_days'].median()),
+    }
+
+    return SegmentationResponse(
+        cutoff_date=cutoff_date,
+        inactivity_days=inactivity_days,
+        H_days=H_days,
+        n_customers=len(segmentation_df),
+        segments=segmentation_df.to_dict(orient="records"),
+        cutoffs=cutoffs,
         summary=summary,
     )
 
