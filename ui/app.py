@@ -65,46 +65,108 @@ LIMIT 20
                 st.plotly_chart(fig, use_container_width=True)
 
 with tab3:
-    st.subheader("Ask a question (Text-to-SQL)")
-
-    q = st.text_input("Question", "Revenue by month in 2011")
-    if st.button("Ask"):
-        r = requests.post(f"{API_URL}/ask", json={"question": q}, timeout=90)
+    st.subheader("Ask a question (Analytics Tools + SQL)")
+    st.caption("The system will automatically use analytics tools (CLV, risk, churn, etc.) or SQL based on your question.")
+    
+    # Sample questions
+    st.markdown("### Sample Questions")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("**Analytics Questions:**")
+        sample_analytics = [
+            "What are the top 10 customers by CLV?",
+            "Who are the high-risk customers likely to churn?",
+            "What is the churn probability for customer 14646 in the next 90 days?",
+            "What is the expected lifetime for customer 14646?",
+            "Show me customer segments and recommended actions"
+        ]
+        for i, sample in enumerate(sample_analytics):
+            if st.button(f"📊 {sample}", key=f"analytics_{i}", use_container_width=True):
+                st.session_state.question = sample
+    
+    with col2:
+        st.markdown("**SQL Questions:**")
+        sample_sql = [
+            "What is the total revenue by country?",
+            "How many transactions were there in December 2011?",
+            "Revenue by month in 2011",
+            "Show me the top 5 countries by customer count"
+        ]
+        for i, sample in enumerate(sample_sql):
+            if st.button(f"💾 {sample}", key=f"sql_{i}", use_container_width=True):
+                st.session_state.question = sample
+    
+    # Question input
+    default_q = st.session_state.get("question", "What are the top 10 customers by CLV?")
+    q = st.text_input("Question", value=default_q)
+    
+    if st.button("Ask", type="primary"):
+        with st.spinner("Processing your question..."):
+            r = requests.post(f"{API_URL}/ask", json={"question": q}, timeout=180)
+        
         if r.status_code != 200:
             st.error(r.text)
         else:
             payload = r.json()
-            st.markdown("### Generated SQL")
-            st.code(payload["sql"], language="sql")
-
+            
+            # Show which tools were used
+            used_tools = payload.get("used_tools", [])
+            debug_info = payload.get("debug_info", {})
+            
+            st.markdown("### Tool Usage")
+            if used_tools:
+                tool_badges = ", ".join([f"`{tool}`" for tool in used_tools])
+                st.success(f"✅ Used analytics tools: {tool_badges}")
+                if debug_info:
+                    st.info(f"Tool calls made: {debug_info.get('tool_calls_made', len(used_tools))}")
+            else:
+                st.info("ℹ️ Used SQL fallback (no analytics tools)")
+            
+            # Show SQL if generated
+            if payload.get("sql"):
+                st.markdown("### Generated SQL")
+                st.code(payload["sql"], language="sql")
+            
+            # Show answer
             st.markdown("### Answer")
-            st.write(payload["answer"])
-
-            df = pd.DataFrame(payload["rows"])
-            st.markdown("### Result preview")
-            st.dataframe(df, use_container_width=True)
-
-            chart = payload.get("chart")
-            if chart and len(df) > 0 and chart.get("x") in df.columns and chart.get("y") in df.columns:
-                st.markdown("### Suggested chart")
-                if chart["type"] == "bar":
-                    fig = px.bar(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
-                elif chart["type"] == "line":
-                    fig = px.line(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
-                else:
-                    fig = px.scatter(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
-                st.plotly_chart(fig, use_container_width=True)
+            st.markdown(payload["answer"])
+            
+            # Show results if available
+            if payload.get("rows") and len(payload["rows"]) > 0:
+                df = pd.DataFrame(payload["rows"])
+                st.markdown(f"### Result preview ({payload.get('row_count', len(df))} rows)")
+                st.dataframe(df, use_container_width=True)
+                
+                # Show chart if available
+                chart = payload.get("chart")
+                if chart and len(df) > 0 and chart.get("x") in df.columns and chart.get("y") in df.columns:
+                    st.markdown("### Suggested chart")
+                    if chart["type"] == "bar":
+                        fig = px.bar(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
+                    elif chart["type"] == "line":
+                        fig = px.line(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
+                    else:
+                        fig = px.scatter(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
+                    st.plotly_chart(fig, use_container_width=True)
+            elif payload.get("row_count", 0) == 0 and not used_tools:
+                st.warning("No results returned. This might be an analytics-only response.")
+            
+            # Debug info (expandable)
+            if debug_info:
+                with st.expander("🔍 Debug Information"):
+                    st.json(debug_info)
 
 with tab4:
     st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
+    st.caption("Cutoff date is fixed at 2011-12-09 (inclusive).")
 
-    cutoff = st.date_input("Cutoff date (calibration end)", value=pd.to_datetime("2011-12-09"))
     horizon = st.slider("CLV horizon (days)", 30, 365, 90)
 
     if st.button("Run CLV"):
         r = requests.post(
             f"{API_URL}/clv",
-            json={"cutoff_date": str(cutoff), "horizon_days": int(horizon)},
+            json={"horizon_days": int(horizon)},
             timeout=180,
         )
         if r.status_code != 200:

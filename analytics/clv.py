@@ -17,6 +17,9 @@ from lifetimes import BetaGeoFitter, GammaGammaFitter
 PURCHASE_SCALE = 1.1  # Update with actual calibrated value from test output
 REVENUE_SCALE = 1.7  # Update with actual calibrated value from test output
 
+# Fixed cutoff date for all CLV analysis
+CUTOFF_DATE = "2011-12-09"
+
 
 @dataclass
 class CLVResult:
@@ -34,7 +37,6 @@ class CLVResult:
 
 def build_rfm(
     transactions: pd.DataFrame, 
-    cutoff_date: str, 
     cap_percentile: float = 100 
 ) -> pd.DataFrame:
     """Build RFM (Recency, Frequency, Monetary) table from transaction data.
@@ -48,7 +50,6 @@ def build_rfm(
     Args:
         transactions: Transaction data with columns: customer_id, invoice_no, 
                      invoice_date, revenue
-        cutoff_date: Date string to use as analysis cutoff (YYYY-MM-DD)
         cap_percentile: Percentile to cap order values (99.5 = cap at 99.5th percentile)
                        Set to 100 to disable capping
     
@@ -57,7 +58,7 @@ def build_rfm(
     """
     df = transactions.copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    cutoff = pd.to_datetime(cutoff_date)
+    cutoff = pd.to_datetime(CUTOFF_DATE)
     
     # ========================================================================
     # Data cleaning: filter to valid transactions before cutoff
