@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
 from app.llm import generate_sql, generate_analytics_answer
 import pandas as pd
+import json
 from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE, CUTOFF_DATE as CLV_CUTOFF_DATE
 from analytics.survival import (
     build_covariate_table,
@@ -136,9 +137,50 @@ def ask(req: AskRequest) -> AskResponse:
     try:
         analytics_result = generate_analytics_answer(schema, req.question)
         
-        # If analytics used tools, return analytics answer
+        # If analytics used tools, check if text_to_sql was used
         if analytics_result.get("tool_calls_made", 0) > 0:
-            # Analytics answer - return with empty SQL result structure
+            used_tools = analytics_result.get("used_tools", [])
+            
+            # If text_to_sql was used, extract SQL and execute it
+            if "text_to_sql" in used_tools:
+                # Extract SQL from debug messages (tool result)
+                debug_messages = analytics_result.get("debug_messages", [])
+                sql_result = None
+                
+                # Find the text_to_sql tool result in debug messages
+                for msg in debug_messages:
+                    if msg.get("role") == "tool" and msg.get("name") == "text_to_sql":
+                        try:
+                            content = json.loads(msg.get("content", "{}"))
+                            if "sql" in content:
+                                sql_result = content
+                                break
+                        except (json.JSONDecodeError, TypeError):
+                            pass
+                
+                # If we found SQL, execute it
+                if sql_result and "sql" in sql_result:
+                    sql = sql_result["sql"]
+                    answer = sql_result.get("answer", analytics_result["answer"])
+                    chart = sql_result.get("chart", None)
+                    
+                    # Execute the SQL query
+                    rows, cols = run_query(sql, limit=500)
+                    return AskResponse(
+                        question=req.question,
+                        sql=sql,
+                        answer=answer,
+                        columns=cols,
+                        rows=rows,
+                        row_count=len(rows),
+                        chart=chart,
+                        used_tools=used_tools,
+                        debug_info={
+                            "tool_calls_made": analytics_result.get("tool_calls_made", 0),
+                        },
+                    )
+            
+            # Analytics answer (non-SQL tools) - return with empty SQL result structure
             return AskResponse(
                 question=req.question,
                 sql="",  # No SQL for analytics answers
@@ -147,7 +189,7 @@ def ask(req: AskRequest) -> AskResponse:
                 rows=[],
                 row_count=0,
                 chart=None,
-                used_tools=analytics_result.get("used_tools", []),
+                used_tools=used_tools,
                 debug_info={
                     "tool_calls_made": analytics_result.get("tool_calls_made", 0),
                     "debug_messages": analytics_result.get("debug_messages", [])
