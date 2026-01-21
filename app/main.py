@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
-from app.llm import generate_sql, result_to_text, validate_sql
+from app.llm import generate_sql, result_to_text, validate_sql, route_question
 import pandas as pd
 from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE
 from analytics.survival import (
@@ -126,59 +126,255 @@ def query(req: QueryRequest) -> QueryResponse:
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+def execute_analytics_function(
+    function_name: str,
+    parameters: Dict[str, Any],
+    transactions_df: pd.DataFrame
+) -> Dict[str, Any]:
+    """
+    Execute an analytics function and return results in AskResponse format.
+    Fixed values: cutoff_date="2011-12-09", inactivity_days=90 for most functions.
+    
+    Args:
+        function_name: Name of the analytics function to execute
+        parameters: Dictionary of function parameters
+        transactions_df: DataFrame with transaction data
+        
+    Returns:
+        Dictionary with: columns, rows, row_count, answer
+    """
+    # Fixed constants
+    FIXED_CUTOFF_DATE = "2011-12-09"
+    FIXED_INACTIVITY_DAYS = 90
+    
+    if function_name == "predict_customer_lifetime_value":
+        # Fixed cutoff_date at 2011-12-09
+        cutoff_date = FIXED_CUTOFF_DATE
+        horizon_days = parameters.get("horizon_days", 90)  # Required, but provide default
+        limit_customers = parameters.get("limit_customers", 10)  # Updated default to 10
+        
+        rfm = build_rfm(transactions_df, cutoff_date=cutoff_date)
+        models = fit_models(rfm)
+        
+        pred_unscaled = predict_clv(models, horizon_days=horizon_days, aov_fallback="global_mean")
+        pred_total_purchases = pred_unscaled["pred_purchases"].sum()
+        pred_total_revenue = pred_unscaled["clv"].sum(skipna=True)
+        
+        target_purchases = pred_total_purchases * PURCHASE_SCALE if PURCHASE_SCALE != 1.0 else None
+        target_revenue = pred_total_revenue * REVENUE_SCALE if REVENUE_SCALE != 1.0 else None
+        
+        pred = predict_clv(
+            models,
+            horizon_days=horizon_days,
+            scale_to_target_purchases=target_purchases,
+            scale_to_target_revenue=target_revenue,
+            aov_fallback="global_mean"
+        )
+        
+        pred = pred.sort_values("clv", ascending=False).head(limit_customers)
+        
+        columns = ["customer_id", "frequency", "recency", "T", "monetary_value", 
+                  "pred_purchases", "pred_aov", "clv"]
+        rows = pred[columns].to_dict(orient="records")
+        
+        answer = f"Predicted Customer Lifetime Value for {len(pred)} customers over {horizon_days} days (cutoff: {cutoff_date}). "
+        answer += f"Top customer CLV: {pred['clv'].max():.2f}, Mean CLV: {pred['clv'].mean():.2f}."
+        
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "answer": answer
+        }
+    
+    elif function_name == "score_churn_risk":
+        # Fixed cutoff_date and inactivity_days
+        cutoff_date = FIXED_CUTOFF_DATE
+        inactivity_days = FIXED_INACTIVITY_DAYS
+        
+        cov = build_covariate_table(
+            transactions=transactions_df,
+            cutoff_date=cutoff_date,
+            inactivity_days=inactivity_days,
+        ).df
+        
+        cox_result = fit_cox_baseline(
+            covariates=cov,
+            covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+            train_frac=0.8,
+            random_state=42,
+            penalizer=0.1,
+        )
+        
+        scored = score_customers(
+            model=cox_result['model'],
+            transactions=transactions_df,
+            cutoff_date=cutoff_date,
+        )
+        
+        columns = ["customer_id", "n_orders", "log_monetary_value", "product_diversity",
+                  "risk_score", "risk_rank", "risk_percentile", "risk_bucket"]
+        rows = scored[columns].to_dict(orient="records")
+        
+        high_risk = (scored["risk_bucket"] == "High").sum()
+        answer = f"Scored {len(scored)} customers for churn risk (cutoff: {cutoff_date}, inactivity: {inactivity_days} days). "
+        answer += f"{high_risk} customers in High risk category."
+        
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "answer": answer
+        }
+    
+    elif function_name == "predict_churn_probability":
+        # Fixed cutoff_date and inactivity_days, X_days is required (default 90)
+        cutoff_date = FIXED_CUTOFF_DATE
+        inactivity_days = FIXED_INACTIVITY_DAYS
+        X_days = parameters.get("X_days", 90)  # Required, but provide default
+        
+        cov = build_covariate_table(
+            transactions=transactions_df,
+            cutoff_date=cutoff_date,
+            inactivity_days=inactivity_days,
+        ).df
+        
+        cox_result = fit_cox_baseline(
+            covariates=cov,
+            covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+            train_frac=0.8,
+            random_state=42,
+            penalizer=0.1,
+        )
+        
+        predictions = predict_churn_probability(
+            model=cox_result['model'],
+            transactions=transactions_df,
+            cutoff_date=cutoff_date,
+            X_days=X_days,
+            inactivity_days=inactivity_days,
+        )
+        
+        columns = ["customer_id", "t0", "X_days", "churn_probability",
+                  "survival_at_t0", "survival_at_t0_plus_X"]
+        rows = predictions.to_dict(orient="records")
+        
+        mean_prob = predictions["churn_probability"].mean()
+        answer = f"Predicted churn probability for {len(predictions)} active customers. "
+        answer += f"Mean probability of churn in next {X_days} days: {mean_prob:.2%} "
+        answer += f"(cutoff: {cutoff_date}, inactivity: {inactivity_days} days)."
+        
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "answer": answer
+        }
+    
+    elif function_name == "customer_segmentation":
+        # Fixed cutoff_date and inactivity_days, H_days is optional (default 365)
+        cutoff_date = FIXED_CUTOFF_DATE
+        inactivity_days = FIXED_INACTIVITY_DAYS
+        H_days = parameters.get("H_days", 365)
+        
+        cov = build_covariate_table(
+            transactions=transactions_df,
+            cutoff_date=cutoff_date,
+            inactivity_days=inactivity_days,
+        ).df
+        
+        cox_result = fit_cox_baseline(
+            covariates=cov,
+            covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+            train_frac=0.8,
+            random_state=42,
+            penalizer=0.1,
+        )
+        
+        segmentation_df, cutoffs = build_segmentation_table(
+            model=cox_result['model'],
+            transactions=transactions_df,
+            covariates_df=cov,
+            cutoff_date=cutoff_date,
+            H_days=H_days,
+        )
+        
+        columns = ["customer_id", "risk_label", "t0", "erl_365_days", 
+                  "life_bucket", "segment", "action_tag", "recommended_action"]
+        rows = segmentation_df[columns].to_dict(orient="records")
+        
+        segment_counts = segmentation_df['segment'].value_counts().to_dict()
+        answer = f"Segmented {len(segmentation_df)} customers into {len(segment_counts)} segments "
+        answer += f"(cutoff: {cutoff_date}, inactivity: {inactivity_days} days, H: {H_days} days). "
+        answer += f"Top segments: {', '.join(list(segment_counts.keys())[:3])}."
+        
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "answer": answer
+        }
+    
+    else:
+        raise ValueError(f"Unknown analytics function: {function_name}")
+
+
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest) -> AskResponse:
     schema = get_schema()
-
-    # First attempt: generate SQL
-    failed_sql = None
-    try:
-        gen = generate_sql(schema, req.question)
-        sql = gen["sql"]
-        failed_sql = sql  # Store for potential repair
+    
+    # Step 1: Route the question using function calling
+    routing = route_question(schema, req.question)
+    
+    if routing["type"] == "analytics":
+        # Step 2a: Execute analytics function
+        # Load transaction data (needed for analytics)
+        sql = """
+        SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
+        FROM transactions
+        WHERE customer_id IS NOT NULL
+        """
+        rows, _ = run_query_internal(sql, max_rows=2_000_000)
+        df = pd.DataFrame(rows)
         
-        # Validate SQL before execution - don't retry on validation errors
-        try:
-            validate_sql(sql)
-        except ValueError as ve:
-            # Validation errors are security issues, don't attempt repair
-            raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
-
-        rows, cols = run_query(sql, limit=500)
+        # Execute analytics function
+        result = execute_analytics_function(
+            routing["function_name"],
+            routing["parameters"],
+            df
+        )
         
-        # Convert query results to natural language text
-        answer = result_to_text(req.question, cols, rows, len(rows))
+        # Convert analytics result to natural language answer
+        answer = result_to_text(
+            req.question,
+            result["columns"],
+            result["rows"],
+            result["row_count"]
+        )
         
         return AskResponse(
             question=req.question,
-            sql=sql,
+            sql="",  # No SQL for analytics functions
             answer=answer,
-            columns=cols,
-            rows=rows,
-            row_count=len(rows),
+            columns=result["columns"],
+            rows=result["rows"],
+            row_count=result["row_count"],
         )
-
-    except HTTPException:
-        # Re-raise HTTP exceptions (validation errors)
-        raise
-    except Exception as e1:
-        # 1 repair attempt: include the error message and regenerate
+    
+    else:
+        # Step 2b: Execute SQL (routing["type"] == "sql")
+        failed_sql = None
         try:
-            from app.llm import improve_repair_question
-            repair_question = improve_repair_question(req.question, str(e1), failed_sql)
-            gen = generate_sql(schema, repair_question)
-            sql = gen["sql"]
+            sql = routing["sql"]
+            failed_sql = sql
             
-            # Validate SQL before execution - don't retry on validation errors
+            # Validate SQL before execution
             try:
                 validate_sql(sql)
             except ValueError as ve:
-                # Validation errors are security issues, don't attempt further repair
                 raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
-
-            rows, cols = run_query(sql, limit=500)
             
-            # Convert query results to natural language text
+            rows, cols = run_query(sql, limit=500)
             answer = result_to_text(req.question, cols, rows, len(rows))
             
             return AskResponse(
@@ -189,11 +385,47 @@ def ask(req: AskRequest) -> AskResponse:
                 rows=rows,
                 row_count=len(rows),
             )
+        
         except HTTPException:
-            # Re-raise HTTP exceptions (validation errors)
             raise
-        except Exception as e2:
-            raise HTTPException(status_code=400, detail=f"Ask failed: {str(e2)}")
+        except Exception as e1:
+            # 1 repair attempt: include the error message and regenerate
+            try:
+                from app.llm import improve_repair_question
+                repair_question = improve_repair_question(req.question, str(e1), failed_sql)
+                
+                # Try routing again with repair question
+                repair_routing = route_question(schema, repair_question)
+                
+                if repair_routing["type"] != "sql":
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Repair attempt resulted in non-SQL response. Original error: {str(e1)}"
+                    )
+                
+                sql = repair_routing["sql"]
+                
+                # Validate SQL before execution
+                try:
+                    validate_sql(sql)
+                except ValueError as ve:
+                    raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
+                
+                rows, cols = run_query(sql, limit=500)
+                answer = result_to_text(req.question, cols, rows, len(rows))
+                
+                return AskResponse(
+                    question=req.question,
+                    sql=sql,
+                    answer=answer,
+                    columns=cols,
+                    rows=rows,
+                    row_count=len(rows),
+                )
+            except HTTPException:
+                raise
+            except Exception as e2:
+                raise HTTPException(status_code=400, detail=f"Ask failed: {str(e2)}")
 
 @app.post("/clv", response_model=CLVResponse)
 def clv(req: CLVRequest) -> CLVResponse:

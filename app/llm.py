@@ -12,6 +12,142 @@ load_dotenv()
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
+# Analytics function definitions with fixed parameters
+ANALYTICS_FUNCTIONS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "predict_customer_lifetime_value",
+            "description": "Predict Customer Lifetime Value (CLV) using BG/NBD and Gamma-Gamma models. Use this for questions about: customer lifetime value, CLV, future customer value, predicted revenue per customer, customer worth, or which customers are most valuable. Calibration cutoff date is fixed at 2011-12-09.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "horizon_days": {
+                        "type": "integer",
+                        "description": "Prediction horizon in days (default: 90)",
+                        "minimum": 1,
+                        "maximum": 365,
+                        "default": 90
+                    },
+                    "limit_customers": {
+                        "type": "integer",
+                        "description": "Maximum number of customers to return (default: 10)",
+                        "minimum": 1,
+                        "maximum": 5000,
+                        "default": 10
+                    }
+                },
+                "required": ["horizon_days"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "score_churn_risk",
+            "description": "Score customers by churn risk using survival analysis (Cox model). Use this for questions about: churn risk, customer retention risk, which customers are likely to churn, risk scoring, or high-risk customers. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "predict_churn_probability",
+            "description": "Predict the probability that active customers will churn in the next X days. Use this for questions about: churn probability, likelihood of leaving, retention probability, or probability of churn. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "X_days": {
+                        "type": "integer",
+                        "description": "Prediction horizon in days (default: 90)",
+                        "minimum": 1,
+                        "maximum": 365,
+                        "default": 90
+                    }
+                },
+                "required": ["X_days"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "customer_segmentation",
+            "description": "Build customer segmentation combining risk labels and expected remaining lifetime. Use this for questions about: customer segments, segmentation, customer groups, risk-based segments, or action recommendations for customers. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "H_days": {
+                        "type": "integer",
+                        "description": "Horizon in days for expected remaining lifetime (default: 365)",
+                        "minimum": 1,
+                        "maximum": 3650,
+                        "default": 365
+                    }
+                },
+                "required": []
+            }
+        }
+    }
+]
+
+# SQL function definition
+SQL_FUNCTION = {
+    "type": "function",
+    "function": {
+        "name": "execute_sql_query",
+        "description": "Execute a SQL SELECT query to answer questions about historical data, aggregations, filtering, reporting, or data exploration. Use this for descriptive questions that don't require predictive modeling, such as: revenue by country, top customers, sales trends, product analysis, or any data aggregation/filtering questions.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "sql": {
+                    "type": "string",
+                    "description": "A valid SQL SELECT query (may start with WITH for CTEs, no semicolons). Must only query the transactions table. Always use LIMIT 500 unless aggregation already produces small output."
+                },
+                "explanation": {
+                    "type": "string",
+                    "description": "Brief explanation of what the query does and what it answers"
+                }
+            },
+            "required": ["sql", "explanation"]
+        }
+    }
+}
+
+# Combine all functions
+ALL_FUNCTIONS = ANALYTICS_FUNCTIONS + [SQL_FUNCTION]
+
+# Updated system prompt for routing
+SYSTEM_ROUTER = """You are a data assistant for an Online Retail SQLite database.
+You can answer questions using either SQL queries or specialized analytics functions.
+
+Available tools:
+1. execute_sql_query - for descriptive questions, aggregations, filtering, reporting, data exploration
+2. Analytics functions - for predictive modeling, CLV prediction, churn analysis, survival analysis
+
+When to use execute_sql_query:
+- Questions about historical data, aggregations, counts, sums, averages
+- Filtering, grouping, sorting data
+- Reporting on what happened
+- Simple data exploration
+- Revenue by country/month/product
+- Top customers/products
+- Sales trends
+
+When to use analytics functions:
+- Questions about predictions, future values, probabilities
+- Customer lifetime value, CLV, future revenue
+- Churn risk, retention risk, churn probability
+- Survival analysis, retention curves
+- Customer segmentation based on risk/lifetime
+
+Always choose the most appropriate tool. If the question can be answered with SQL, use execute_sql_query. If it requires predictive modeling or advanced analytics, use the appropriate analytics function.
+"""
+
 SYSTEM = """You are a data assistant for an Online Retail SQLite database.
 You must produce a SINGLE valid JSON object with keys:
 - sql: string (a single SELECT query, may start with WITH, no semicolons)
@@ -131,6 +267,117 @@ def generate_sql(schema: Dict[str, Any], question: str, max_retries: int = 3, re
     
     # Should not reach here, but handle just in case
     raise ValueError(f"Failed to generate SQL after {max_retries} attempts. Last error: {str(last_error)}")
+
+
+def route_question(
+    schema: Dict[str, Any], 
+    question: str, 
+    max_retries: int = 3, 
+    retry_delay: float = 1.0
+) -> Dict[str, Any]:
+    """
+    Route question using function calling - LLM decides between SQL or analytics.
+    
+    Args:
+        schema: Database schema
+        question: Natural language question
+        max_retries: Maximum number of retry attempts
+        retry_delay: Delay between retries in seconds
+        
+    Returns:
+        Dictionary with:
+        - type: "sql" or "analytics"
+        - If type="sql": sql, answer
+        - If type="analytics": function_name, parameters, answer
+    """
+    prompt = build_prompt(schema, question)
+    last_error = None
+    
+    for attempt in range(max_retries):
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=[
+                    {"role": "system", "content": SYSTEM_ROUTER},
+                    {"role": "user", "content": prompt},
+                ],
+                tools=ALL_FUNCTIONS,
+                tool_choice="auto",  # Let LLM decide which tool to use
+                temperature=0,
+                timeout=30.0,
+            )
+            
+            message = resp.choices[0].message
+            
+            # Check if LLM wants to call a function
+            if message.tool_calls and len(message.tool_calls) > 0:
+                tool_call = message.tool_calls[0]  # Take first tool call
+                function_name = tool_call.function.name
+                
+                try:
+                    function_args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(retry_delay * (attempt + 1))
+                        continue
+                    raise ValueError(f"Invalid JSON in function arguments: {str(e)}")
+                
+                if function_name == "execute_sql_query":
+                    # SQL function was chosen
+                    sql = function_args.get("sql", "").strip()
+                    explanation = function_args.get("explanation", "")
+                    
+                    # Validate SQL before returning
+                    try:
+                        validate_sql(sql)
+                    except ValueError as ve:
+                        if attempt < max_retries - 1:
+                            time.sleep(retry_delay * (attempt + 1))
+                            continue
+                        raise ValueError(f"Generated SQL failed validation: {str(ve)}")
+                    
+                    return {
+                        "type": "sql",
+                        "sql": sql,
+                        "answer": explanation or "SQL query generated to answer your question."
+                    }
+                else:
+                    # Analytics function was chosen
+                    return {
+                        "type": "analytics",
+                        "function_name": function_name,
+                        "parameters": function_args,
+                        "answer": f"Using {function_name} to answer your question."
+                    }
+            else:
+                # No function call - this shouldn't happen often, but handle it
+                # Fallback: try to generate SQL the old way
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay * (attempt + 1))
+                    continue
+                raise ValueError("LLM did not call any function. Please rephrase your question.")
+                
+        except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = retry_delay * (2 ** attempt)
+                time.sleep(wait_time)
+                continue
+            raise
+        except APIError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            raise
+        except Exception as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (attempt + 1))
+                continue
+            raise ValueError(f"Failed to route question: {str(e)}")
+    
+    raise ValueError(f"Failed to route question after {max_retries} attempts. Last error: {str(last_error)}")
 
 
 SYSTEM_RESULT_TO_TEXT = """You are a data assistant that converts SQL query results into natural language answers.
