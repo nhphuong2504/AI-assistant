@@ -2,9 +2,9 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
-from app.llm import generate_sql, generate_analytics_answer
+from app.llm import generate_sql
 import pandas as pd
-from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE, CUTOFF_DATE as CLV_CUTOFF_DATE
+from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE
 from analytics.survival import (
     build_covariate_table,
     fit_km_all,
@@ -44,10 +44,9 @@ class AskResponse(BaseModel):
     rows: List[Dict[str, Any]]
     row_count: int
     chart: Optional[Dict[str, Any]] = None
-    used_tools: Optional[List[str]] = None
-    debug_info: Optional[Dict[str, Any]] = None
 
 class CLVRequest(BaseModel):
+    cutoff_date: str = Field("2011-09-30", description="Calibration cutoff date (YYYY-MM-DD)")
     horizon_days: int = Field(180, ge=1, le=3650)
     limit_customers: int = Field(5000, ge=10, le=200000)
 
@@ -132,36 +131,7 @@ def query(req: QueryRequest) -> QueryResponse:
 def ask(req: AskRequest) -> AskResponse:
     schema = get_schema()
 
-    # First attempt: try analytics with tool calling
-    try:
-        analytics_result = generate_analytics_answer(schema, req.question)
-        
-        # If analytics used tools, return analytics answer
-        if analytics_result.get("tool_calls_made", 0) > 0:
-            # Analytics answer - return with empty SQL result structure
-            return AskResponse(
-                question=req.question,
-                sql="",  # No SQL for analytics answers
-                answer=analytics_result["answer"],
-                columns=[],
-                rows=[],
-                row_count=0,
-                chart=None,
-                used_tools=analytics_result.get("used_tools", []),
-                debug_info={
-                    "tool_calls_made": analytics_result.get("tool_calls_made", 0),
-                    "debug_messages": analytics_result.get("debug_messages", [])
-                },
-            )
-    except Exception as e_analytics:
-        # Analytics failed, fall through to SQL fallback
-        # Log the exception for debugging (in production, use proper logging)
-        import traceback
-        print(f"Analytics attempt failed: {e_analytics}")
-        print(traceback.format_exc())
-        pass
-
-    # Fallback: generate SQL (original behavior)
+    # First attempt: generate SQL
     try:
         gen = generate_sql(schema, req.question)
         sql = gen["sql"]
@@ -216,7 +186,7 @@ def clv(req: CLVRequest) -> CLVResponse:
     rows, _ = run_query_internal(sql, max_rows=2_000_000)  # internal call, not user SQL
     df = pd.DataFrame(rows)
 
-    rfm = build_rfm(df)
+    rfm = build_rfm(df, cutoff_date=req.cutoff_date)
     models = fit_models(rfm)
     
     # First get unscaled predictions to calculate target totals
@@ -251,7 +221,7 @@ def clv(req: CLVRequest) -> CLVResponse:
     }
 
     return CLVResponse(
-        cutoff_date=CLV_CUTOFF_DATE,
+        cutoff_date=req.cutoff_date,
         horizon_days=req.horizon_days,
         top_customers=all_customers.to_dict(orient="records"),
         summary=summary,
@@ -273,6 +243,7 @@ def km_all(inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity
 
     cov = build_covariate_table(
         transactions=df,
+        cutoff_date=CUTOFF_DATE,
         inactivity_days=inactivity_days,
     ).df
 
@@ -295,6 +266,7 @@ def km_all(inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity
 @app.post("/survival/score", response_model=ScoreCustomersResponse)
 def score_customers_endpoint(
     inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for scoring (YYYY-MM-DD)"),
 ) -> ScoreCustomersResponse:
     """
     Score customers using a fitted Cox model to predict churn risk.
@@ -310,6 +282,7 @@ def score_customers_endpoint(
     # Build covariate table for model fitting
     cov = build_covariate_table(
         transactions=df,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
     ).df
 
@@ -327,6 +300,7 @@ def score_customers_endpoint(
     scored = score_customers(
         model=cox_model,
         transactions=df,
+        cutoff_date=cutoff_date,
     )
 
     # Create summary
@@ -338,7 +312,7 @@ def score_customers_endpoint(
     }
 
     return ScoreCustomersResponse(
-        cutoff_date=CUTOFF_DATE,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
         n_customers=len(scored),
         scored_customers=scored.to_dict(orient="records"),
@@ -349,6 +323,7 @@ def score_customers_endpoint(
 @app.post("/survival/churn-probability", response_model=ChurnProbabilityResponse)
 def churn_probability_endpoint(
     inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for prediction (YYYY-MM-DD)"),
     X_days: int = Query(90, ge=1, le=3650, description="Prediction horizon in days"),
 ) -> ChurnProbabilityResponse:
     """
@@ -366,6 +341,7 @@ def churn_probability_endpoint(
     # Build covariate table for model fitting
     cov = build_covariate_table(
         transactions=df,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
     ).df
 
@@ -383,6 +359,7 @@ def churn_probability_endpoint(
     predictions = predict_churn_probability(
         model=cox_model,
         transactions=df,
+        cutoff_date=cutoff_date,
         X_days=X_days,
         inactivity_days=inactivity_days,
     )
@@ -399,7 +376,7 @@ def churn_probability_endpoint(
     }
 
     return ChurnProbabilityResponse(
-        cutoff_date=CUTOFF_DATE,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
         X_days=X_days,
         n_customers=len(predictions),
@@ -411,6 +388,7 @@ def churn_probability_endpoint(
 @app.post("/survival/expected-lifetime", response_model=ExpectedLifetimeResponse)
 def expected_lifetime_endpoint(
     inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for computation (YYYY-MM-DD)"),
     H_days: int = Query(365, ge=1, le=3650, description="Horizon in days for restricted expectation"),
 ) -> ExpectedLifetimeResponse:
     """
@@ -427,6 +405,7 @@ def expected_lifetime_endpoint(
     # Build covariate table for model fitting
     cov = build_covariate_table(
         transactions=df,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
     ).df
 
@@ -459,7 +438,7 @@ def expected_lifetime_endpoint(
     }
 
     return ExpectedLifetimeResponse(
-        cutoff_date=CUTOFF_DATE,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
         H_days=H_days,
         n_customers=len(expected_lifetimes),
@@ -471,6 +450,7 @@ def expected_lifetime_endpoint(
 @app.post("/survival/segmentation", response_model=SegmentationResponse)
 def segmentation_endpoint(
     inactivity_days: int = Query(INACTIVITY_DAYS, description="Inactivity days threshold for churn definition"),
+    cutoff_date: str = Query(CUTOFF_DATE, description="Cutoff date for segmentation (YYYY-MM-DD)"),
     H_days: int = Query(365, ge=1, le=3650, description="Horizon in days for expected remaining lifetime"),
 ) -> SegmentationResponse:
     """
@@ -487,6 +467,7 @@ def segmentation_endpoint(
     # Build covariate table
     cov = build_covariate_table(
         transactions=df,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
     ).df
 
@@ -505,6 +486,7 @@ def segmentation_endpoint(
         model=cox_model,
         transactions=df,
         covariates_df=cov,
+        cutoff_date=cutoff_date,
         H_days=H_days,
     )
 
@@ -520,7 +502,7 @@ def segmentation_endpoint(
     }
 
     return SegmentationResponse(
-        cutoff_date=CUTOFF_DATE,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
         H_days=H_days,
         n_customers=len(segmentation_df),

@@ -20,6 +20,7 @@ class CovariateTable:
 
 def build_covariate_table(
     transactions: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
     inactivity_days: int = INACTIVITY_DAYS,
 ) -> CovariateTable:
     """
@@ -40,7 +41,7 @@ def build_covariate_table(
     """
     df = transactions.copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    cutoff = pd.to_datetime(CUTOFF_DATE)
+    cutoff = pd.to_datetime(cutoff_date)
 
     # Observation window (inclusive)
     df = df[df["invoice_date"] <= cutoff]
@@ -627,6 +628,7 @@ def validate_cox_model(
 def score_customers(
     model: CoxPHFitter,
     transactions: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
 ) -> pd.DataFrame:
     """
     Leakage-free scoring and ranking pipeline using a fitted Cox model.
@@ -637,6 +639,7 @@ def score_customers(
     Args:
         model: Fitted CoxPHFitter model (must NOT be refit)
         transactions: DataFrame with customer_id, invoice_no, invoice_date, revenue, stock_code
+        cutoff_date: Cutoff date (inclusive) for feature computation (YYYY-MM-DD)
     
     Returns:
         DataFrame with columns:
@@ -656,7 +659,7 @@ def score_customers(
     # Step 1: Feature construction at cutoff (leakage-free)
     df = transactions.copy()
     df["invoice_date"] = pd.to_datetime(df["invoice_date"])
-    cutoff = pd.to_datetime(CUTOFF_DATE)
+    cutoff = pd.to_datetime(cutoff_date)
     
     # Filter to data up to cutoff (inclusive)
     df = df[df["invoice_date"] <= cutoff]
@@ -767,6 +770,7 @@ def score_customers(
 def predict_churn_probability(
     model: CoxPHFitter,
     transactions: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
     X_days: int = 90,
     inactivity_days: int = INACTIVITY_DAYS,
 ) -> pd.DataFrame:
@@ -784,6 +788,7 @@ def predict_churn_probability(
     Args:
         model: Fitted CoxPHFitter model (must NOT be refit)
         transactions: DataFrame with customer_id, invoice_no, invoice_date, revenue, stock_code
+        cutoff_date: Cutoff date (inclusive) for feature computation (YYYY-MM-DD)
         X_days: Prediction horizon in days (default: 90)
         inactivity_days: Inactivity days threshold for churn definition (default: 90)
     
@@ -799,6 +804,7 @@ def predict_churn_probability(
     # Step 1: Build covariate table to get tenure_days and event
     cov_table = build_covariate_table(
         transactions=transactions,
+        cutoff_date=cutoff_date,
         inactivity_days=inactivity_days,
     )
     cov = cov_table.df
@@ -1015,6 +1021,7 @@ def build_segmentation_table(
     model: CoxPHFitter,
     transactions: pd.DataFrame,
     covariates_df: pd.DataFrame,
+    cutoff_date: str = CUTOFF_DATE,
     H_days: int = 365,
 ) -> Tuple[pd.DataFrame, Dict[str, float]]:
     """
@@ -1029,6 +1036,7 @@ def build_segmentation_table(
         model: Fitted CoxPHFitter model (must NOT be refit)
         transactions: DataFrame with customer_id, invoice_no, invoice_date, revenue, stock_code
         covariates_df: DataFrame with customer_id, event, duration (or tenure_days), and Cox covariates
+        cutoff_date: Cutoff date for scoring (YYYY-MM-DD)
         H_days: Horizon for expected remaining lifetime (default: 365)
     
     Returns:
@@ -1041,6 +1049,7 @@ def build_segmentation_table(
     df_scores = score_customers(
         model=model,
         transactions=transactions,
+        cutoff_date=cutoff_date,
     )
     
     # Extract risk_label from risk_bucket
