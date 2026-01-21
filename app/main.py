@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
-from app.llm import generate_sql
+from app.llm import generate_sql, result_to_text, validate_sql
 import pandas as pd
 from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE
 from analytics.survival import (
@@ -43,7 +43,6 @@ class AskResponse(BaseModel):
     columns: List[str]
     rows: List[Dict[str, Any]]
     row_count: int
-    chart: Optional[Dict[str, Any]] = None
 
 class CLVRequest(BaseModel):
     cutoff_date: str = Field("2011-09-30", description="Calibration cutoff date (YYYY-MM-DD)")
@@ -132,13 +131,24 @@ def ask(req: AskRequest) -> AskResponse:
     schema = get_schema()
 
     # First attempt: generate SQL
+    failed_sql = None
     try:
         gen = generate_sql(schema, req.question)
         sql = gen["sql"]
-        answer = gen["answer"]
-        chart = gen.get("chart", None)
+        failed_sql = sql  # Store for potential repair
+        
+        # Validate SQL before execution - don't retry on validation errors
+        try:
+            validate_sql(sql)
+        except ValueError as ve:
+            # Validation errors are security issues, don't attempt repair
+            raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
 
         rows, cols = run_query(sql, limit=500)
+        
+        # Convert query results to natural language text
+        answer = result_to_text(req.question, cols, rows, len(rows))
+        
         return AskResponse(
             question=req.question,
             sql=sql,
@@ -146,23 +156,31 @@ def ask(req: AskRequest) -> AskResponse:
             columns=cols,
             rows=rows,
             row_count=len(rows),
-            chart=chart,
         )
 
+    except HTTPException:
+        # Re-raise HTTP exceptions (validation errors)
+        raise
     except Exception as e1:
         # 1 repair attempt: include the error message and regenerate
         try:
-            repair_question = (
-                f"{req.question}\n\n"
-                f"NOTE: The previous query failed with error: {str(e1)}\n"
-                f"Please generate a corrected SELECT query."
-            )
+            from app.llm import improve_repair_question
+            repair_question = improve_repair_question(req.question, str(e1), failed_sql)
             gen = generate_sql(schema, repair_question)
             sql = gen["sql"]
-            answer = gen["answer"]
-            chart = gen.get("chart", None)
+            
+            # Validate SQL before execution - don't retry on validation errors
+            try:
+                validate_sql(sql)
+            except ValueError as ve:
+                # Validation errors are security issues, don't attempt further repair
+                raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
 
             rows, cols = run_query(sql, limit=500)
+            
+            # Convert query results to natural language text
+            answer = result_to_text(req.question, cols, rows, len(rows))
+            
             return AskResponse(
                 question=req.question,
                 sql=sql,
@@ -170,8 +188,10 @@ def ask(req: AskRequest) -> AskResponse:
                 columns=cols,
                 rows=rows,
                 row_count=len(rows),
-                chart=chart,
             )
+        except HTTPException:
+            # Re-raise HTTP exceptions (validation errors)
+            raise
         except Exception as e2:
             raise HTTPException(status_code=400, detail=f"Ask failed: {str(e2)}")
 

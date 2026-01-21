@@ -1,7 +1,6 @@
 import streamlit as st
 import pandas as pd
 import requests
-import plotly.express as px
 
 API_URL = st.sidebar.text_input("API URL", "http://127.0.0.1:8000")
 
@@ -49,21 +48,6 @@ LIMIT 20
             st.write(f"Rows returned: {payload['row_count']}")
             st.dataframe(df, use_container_width=True)
 
-            if len(df.columns) >= 2 and len(df) > 0:
-                st.markdown("### Quick chart")
-                x = st.selectbox("X axis", options=list(df.columns), index=0)
-                y = st.selectbox("Y axis", options=list(df.columns), index=1)
-                chart_type = st.selectbox("Chart type", ["bar", "line", "scatter"], index=0)
-
-                if chart_type == "bar":
-                    fig = px.bar(df, x=x, y=y)
-                elif chart_type == "line":
-                    fig = px.line(df, x=x, y=y)
-                else:
-                    fig = px.scatter(df, x=x, y=y)
-
-                st.plotly_chart(fig, use_container_width=True)
-
 with tab3:
     st.subheader("Ask a question (Text-to-SQL)")
 
@@ -74,26 +58,18 @@ with tab3:
             st.error(r.text)
         else:
             payload = r.json()
-            st.markdown("### Generated SQL")
-            st.code(payload["sql"], language="sql")
-
+            
             st.markdown("### Answer")
-            st.write(payload["answer"])
+            st.markdown(payload["answer"])
 
             df = pd.DataFrame(payload["rows"])
-            st.markdown("### Result preview")
-            st.dataframe(df, use_container_width=True)
-
-            chart = payload.get("chart")
-            if chart and len(df) > 0 and chart.get("x") in df.columns and chart.get("y") in df.columns:
-                st.markdown("### Suggested chart")
-                if chart["type"] == "bar":
-                    fig = px.bar(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
-                elif chart["type"] == "line":
-                    fig = px.line(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
-                else:
-                    fig = px.scatter(df, x=chart["x"], y=chart["y"], title=chart.get("title"))
-                st.plotly_chart(fig, use_container_width=True)
+            with st.expander("View Generated SQL"):
+                st.code(payload["sql"], language="sql")
+            
+            if len(df) > 0:
+                with st.expander("View Raw Data"):
+                    st.write(f"Rows returned: {payload['row_count']}")
+                    st.dataframe(df, use_container_width=True)
 
 with tab4:
     st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
@@ -116,10 +92,6 @@ with tab4:
             df = pd.DataFrame(payload["top_customers"])
             st.dataframe(df, use_container_width=True)
 
-            if "clv" in df.columns:
-                fig = px.bar(df, x="customer_id", y="clv", title="Top customers by predicted CLV")
-                st.plotly_chart(fig, use_container_width=True)
-
 with tab5:
     st.subheader("Survival Analysis")
     st.caption("Cutoff date is fixed at 2011-12-09 (inclusive). Inactivity days is fixed at 90 days.")
@@ -138,16 +110,10 @@ with tab5:
             st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
             st.write(f"N customers: {payload['n_customers']} | Churn rate: {payload['churn_rate']:.3f}")
 
-            # Build a plotting dataframe
+            # Display survival curve data
             plot_df = pd.DataFrame(payload["survival_curve"])
-
-            fig = px.line(
-                plot_df,
-                x="time",
-                y="survival",
-                title="Kaplan–Meier Survival Curve (All customers)",
-            )
-            st.plotly_chart(fig, use_container_width=True)
+            st.markdown("### Survival Curve Data")
+            st.dataframe(plot_df, use_container_width=True)
 
     st.markdown("## Customer Risk Scoring (Cox Model)")
 
@@ -189,19 +155,6 @@ with tab5:
             st.markdown("### Scored Customers")
             st.dataframe(df, use_container_width=True)
 
-            # Charts
-            if len(df) > 0:
-                st.markdown("### Risk Score Distribution")
-                fig = px.histogram(df, x="risk_score", nbins=50, title="Distribution of Risk Scores")
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### Risk Percentile vs Risk Score")
-                fig = px.scatter(df, x="risk_percentile", y="risk_score", 
-                               color="risk_bucket", 
-                               title="Risk Percentile vs Risk Score",
-                               labels={"risk_percentile": "Risk Percentile", "risk_score": "Risk Score"})
-                st.plotly_chart(fig, use_container_width=True)
-
     st.markdown("## Churn Probability Prediction (Cox Model)")
 
     col1, col2 = st.columns(2)
@@ -239,26 +192,6 @@ with tab5:
             st.markdown("### Churn Probability Predictions")
             st.dataframe(df, use_container_width=True)
 
-            # Charts
-            if len(df) > 0:
-                st.markdown("### Churn Probability Distribution")
-                fig = px.histogram(df, x="churn_probability", nbins=50, 
-                                 title=f"Distribution of Churn Probabilities (next {X_days} days)")
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### Churn Probability vs Current Duration (t0)")
-                fig = px.scatter(df, x="t0", y="churn_probability", 
-                               title=f"Churn Probability vs Current Duration (next {X_days} days)",
-                               labels={"t0": "Current Duration (days)", "churn_probability": "Churn Probability"})
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### Survival Probabilities")
-                fig = px.scatter(df, x="survival_at_t0", y="survival_at_t0_plus_X",
-                               title="Survival at t0 vs Survival at t0+X",
-                               labels={"survival_at_t0": "Survival at t0", 
-                                      "survival_at_t0_plus_X": "Survival at t0+X"})
-                st.plotly_chart(fig, use_container_width=True)
-
     st.markdown("## Expected Remaining Lifetime (Cox Model)")
 
     col1 = st.columns(1)[0]
@@ -294,34 +227,6 @@ with tab5:
             df = pd.DataFrame(payload['expected_lifetimes'])
             st.markdown("### Expected Remaining Lifetime Predictions")
             st.dataframe(df, use_container_width=True)
-
-            # Charts
-            if len(df) > 0:
-                st.markdown("### Expected Lifetime Distribution")
-                fig = px.histogram(df, x="expected_remaining_life_days", nbins=50, 
-                                 title=f"Distribution of Expected Remaining Lifetime (horizon: {H_days} days)")
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### Expected Lifetime vs Current Duration (t0)")
-                fig = px.scatter(df, x="t0", y="expected_remaining_life_days", 
-                               title=f"Expected Remaining Lifetime vs Current Duration (horizon: {H_days} days)",
-                               labels={"t0": "Current Duration (days)", 
-                                      "expected_remaining_life_days": "Expected Remaining Lifetime (days)"})
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Show relationship: customers with longer tenure should generally have lower expected remaining lifetime
-                # (they've already "used up" more of their lifetime)
-                st.markdown("### Expected Lifetime by Current Duration Bins")
-                bins = pd.cut(df['t0'], bins=10)
-                df['t0_bin'] = bins
-                df['t0_bin_center'] = df['t0_bin'].apply(lambda x: x.mid)
-                bin_stats = df.groupby('t0_bin_center')['expected_remaining_life_days'].agg(['mean', 'std', 'count']).reset_index()
-                fig = px.bar(bin_stats, x='t0_bin_center', y='mean',
-                           error_y='std',
-                           title="Mean Expected Remaining Lifetime by Current Duration",
-                           labels={"t0_bin_center": "Current Duration (days)", 
-                                  "mean": "Mean Expected Remaining Lifetime (days)"})
-                st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("## Customer Segmentation (Risk × Expected Lifetime)")
 
@@ -378,34 +283,8 @@ with tab5:
             st.markdown("### Full Segmentation Table")
             st.dataframe(df, use_container_width=True)
 
-            # Charts
+            # Filter by segment
             if len(df) > 0:
-                st.markdown("### Segment Distribution (Bar Chart)")
-                segment_counts = df['segment'].value_counts().sort_index()
-                fig = px.bar(x=segment_counts.index, y=segment_counts.values,
-                           title="Number of Customers by Segment",
-                           labels={"x": "Segment", "y": "Number of Customers"})
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### Risk Label vs Life Bucket (Heatmap)")
-                pivot = pd.crosstab(df['risk_label'], df['life_bucket'])
-                fig = px.imshow(pivot.values, 
-                              labels=dict(x="Life Bucket", y="Risk Label", color="Count"),
-                              x=pivot.columns,
-                              y=pivot.index,
-                              title="Customer Count by Risk Label × Life Bucket",
-                              text_auto=True,
-                              aspect="auto")
-                st.plotly_chart(fig, use_container_width=True)
-
-                st.markdown("### ERL Distribution by Segment")
-                fig = px.box(df, x='segment', y='erl_365_days',
-                           title="Expected Remaining Lifetime Distribution by Segment",
-                           labels={"segment": "Segment", "erl_365_days": "Expected Remaining Lifetime (days)"})
-                fig.update_xaxes(tickangle=45)
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Filter by segment
                 st.markdown("### Filter by Segment")
                 selected_segment = st.selectbox("Select segment to view details", 
                                               options=sorted(df['segment'].unique()))
