@@ -45,7 +45,7 @@ ANALYTICS_FUNCTIONS = [
         "type": "function",
         "function": {
             "name": "score_churn_risk",
-            "description": "Score customers by churn risk using survival analysis (Cox model). Use this for questions about: churn risk, customer retention risk, which customers are likely to churn, risk scoring, or high-risk customers. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "description": "Rank and score customers by relative churn risk (risk_score, risk_rank, risk_bucket: High/Medium/Low). Returns RISK SCORES for ranking/prioritization, NOT probabilities. Use this for: ranking customers by risk, identifying high-risk customers, risk-based prioritization, or which customers need attention first. Returns risk_score (higher = higher risk), risk_rank, risk_percentile, and risk_bucket. Do NOT use for probability questions. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
             "parameters": {
                 "type": "object",
                 "properties": {},
@@ -57,7 +57,7 @@ ANALYTICS_FUNCTIONS = [
         "type": "function",
         "function": {
             "name": "predict_churn_probability",
-            "description": "Predict the probability that active customers will churn in the next X days. Use this for questions about: churn probability, likelihood of leaving, retention probability, or probability of churn. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "description": "Predict the PROBABILITY (0-1) that active customers will churn in the next X days. Returns actual churn probabilities, not risk scores. Use this for: 'what is the probability customer X will churn in 90 days?', 'likelihood of churn', 'churn probability', or 'probability of leaving in X days'. Returns churn_probability (0.0 to 1.0), survival_at_t0, and survival_at_t0_plus_X. Do NOT use for risk ranking or lifetime questions. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -76,8 +76,28 @@ ANALYTICS_FUNCTIONS = [
     {
         "type": "function",
         "function": {
+            "name": "expected_remaining_lifetime",
+            "description": "Compute EXPECTED REMAINING LIFETIME in days for active customers (how long they will stay). Returns expected_remaining_life_days (number of days), NOT probabilities or risk scores. Use this for: 'how long will customer X stay?', 'expected remaining lifetime', 'customer lifetime expectancy', 'how many days until churn', or 'remaining customer duration'. Returns expected_remaining_life_days (numeric days), t0 (current tenure), and H_days (horizon). Do NOT use for probability or risk ranking questions. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "H_days": {
+                        "type": "integer",
+                        "description": "Horizon in days for restricted expectation (default: 365)",
+                        "minimum": 1,
+                        "maximum": 365,
+                        "default": 365
+                    }
+                },
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "customer_segmentation",
-            "description": "Build customer segmentation combining risk labels and expected remaining lifetime. Use this for questions about: customer segments, segmentation, customer groups, risk-based segments, or action recommendations for customers. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
+            "description": "Build comprehensive customer segmentation combining RISK LABELS (High/Medium/Low from churn risk) and EXPECTED REMAINING LIFETIME buckets (Short/Medium/Long). Returns 9 segments (e.g., 'High-Long', 'Medium-Medium', 'Low-Short') with action tags and recommended actions. Use this for: customer segmentation, segment analysis, action recommendations, customer groups by risk and lifetime, strategic customer management, or which actions to take for different customer types. Returns segment, risk_label, life_bucket, action_tag, recommended_action, erl_365_days. This is a COMPREHENSIVE segmentation that combines both risk and lifetime - do NOT use for individual risk scores, probabilities, or lifetime values alone. Cutoff date is fixed at 2011-12-09, inactivity days is fixed at 90.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -85,7 +105,7 @@ ANALYTICS_FUNCTIONS = [
                         "type": "integer",
                         "description": "Horizon in days for expected remaining lifetime (default: 365)",
                         "minimum": 1,
-                        "maximum": 3650,
+                        "maximum": 365,
                         "default": 365
                     }
                 },

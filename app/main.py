@@ -271,6 +271,48 @@ def execute_analytics_function(
             "answer": answer
         }
     
+    elif function_name == "expected_remaining_lifetime":
+        # Fixed cutoff_date and inactivity_days, H_days is optional (default 365)
+        cutoff_date = FIXED_CUTOFF_DATE
+        inactivity_days = FIXED_INACTIVITY_DAYS
+        H_days = parameters.get("H_days", 365)
+        
+        cov = build_covariate_table(
+            transactions=transactions_df,
+            cutoff_date=cutoff_date,
+            inactivity_days=inactivity_days,
+        ).df
+        
+        cox_result = fit_cox_baseline(
+            covariates=cov,
+            covariate_cols=['n_orders', 'log_monetary_value', 'product_diversity'],
+            train_frac=0.8,
+            random_state=42,
+            penalizer=0.1,
+        )
+        
+        expected_lifetimes = expected_remaining_lifetime(
+            model=cox_result['model'],
+            covariates_df=cov,
+            H_days=H_days,
+            inactivity_days=inactivity_days,
+        )
+        
+        columns = ["customer_id", "t0", "H_days", "expected_remaining_life_days"]
+        rows = expected_lifetimes[columns].to_dict(orient="records")
+        
+        mean_lifetime = expected_lifetimes["expected_remaining_life_days"].mean()
+        answer = f"Computed expected remaining lifetime for {len(expected_lifetimes)} active customers. "
+        answer += f"Mean expected remaining lifetime: {mean_lifetime:.2f} days "
+        answer += f"(cutoff: {cutoff_date}, inactivity: {inactivity_days} days, H: {H_days} days)."
+        
+        return {
+            "columns": columns,
+            "rows": rows,
+            "row_count": len(rows),
+            "answer": answer
+        }
+    
     elif function_name == "customer_segmentation":
         # Fixed cutoff_date and inactivity_days, H_days is optional (default 365)
         cutoff_date = FIXED_CUTOFF_DATE
