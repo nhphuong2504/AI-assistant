@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 from typing import Any, Dict, List, Optional
 from app.db import get_schema, run_query, run_query_internal
-from app.llm import generate_sql, result_to_text, validate_sql, route_question
+from app.llm_langchain import ask_question, clear_memory
 import pandas as pd
 from analytics.clv import build_rfm, fit_models, predict_clv, PURCHASE_SCALE, REVENUE_SCALE
 from analytics.survival import (
@@ -32,17 +32,14 @@ class QueryResponse(BaseModel):
     rows: List[Dict[str, Any]]
     row_count: int
 
-class AskRequest(BaseModel):
+class AskLangChainRequest(BaseModel):
     question: str = Field(..., min_length=1, description="Natural language question")
+    use_memory: bool = Field(True, description="Whether to use conversation memory")
+    thread_id: str = Field("default", description="Thread ID for conversation memory (allows multiple concurrent conversations)")
 
-
-class AskResponse(BaseModel):
+class AskLangChainResponse(BaseModel):
     question: str
-    sql: str
     answer: str
-    columns: List[str]
-    rows: List[Dict[str, Any]]
-    row_count: int
 
 class CLVRequest(BaseModel):
     cutoff_date: str = Field("2011-09-30", description="Calibration cutoff date (YYYY-MM-DD)")
@@ -132,7 +129,7 @@ def execute_analytics_function(
     transactions_df: pd.DataFrame
 ) -> Dict[str, Any]:
     """
-    Execute an analytics function and return results in AskResponse format.
+    Execute an analytics function and return results in a dictionary format.
     Fixed values: cutoff_date="2011-12-09", inactivity_days=90 for most functions.
     
     Args:
@@ -361,119 +358,29 @@ def execute_analytics_function(
         raise ValueError(f"Unknown analytics function: {function_name}")
 
 
-@app.post("/ask", response_model=AskResponse)
-def ask(req: AskRequest) -> AskResponse:
-    schema = get_schema()
-    
-    # Step 1: Route the question using function calling
-    routing = route_question(schema, req.question)
-    
-    if routing["type"] == "analytics":
-        # Step 2a: Execute analytics function
-        # Load transaction data (needed for analytics)
-        sql = """
-        SELECT customer_id, invoice_no, invoice_date, revenue, stock_code, country
-        FROM transactions
-        WHERE customer_id IS NOT NULL
-        """
-        rows, _ = run_query_internal(sql, max_rows=2_000_000)
-        df = pd.DataFrame(rows)
-        
-        # Execute analytics function
-        result = execute_analytics_function(
-            routing["function_name"],
-            routing["parameters"],
-            df
-        )
-        
-        # Convert analytics result to natural language answer
-        # For analytics, calculate stats on all rows but limit what we send to LLM
-        # Use segment-aware logic for customer_segmentation
-        is_segmentation = routing["function_name"] == "customer_segmentation"
-        answer = result_to_text(
-            req.question,
-            result["columns"],
-            result["rows"],
-            result["row_count"],
-            large_result_threshold=150,  # Keep low to trigger summary mode for large datasets
-            max_rows_for_llm=100,  # Never send more than 100 rows to LLM
-            is_segmentation=is_segmentation
-        )
-        
-        return AskResponse(
+@app.post("/ask-langchain", response_model=AskLangChainResponse)
+def ask_langchain(req: AskLangChainRequest) -> AskLangChainResponse:
+    """
+    Ask a question using LangChain agent - supports multi-step reasoning and conversation memory.
+    This endpoint uses LangChain for more natural language responses and multi-tool orchestration.
+    """
+    try:
+        answer = ask_question(req.question, use_memory=req.use_memory, thread_id=req.thread_id)
+        return AskLangChainResponse(
             question=req.question,
-            sql="",  # No SQL for analytics functions
-            answer=answer,
-            columns=result["columns"],
-            rows=result["rows"],
-            row_count=result["row_count"],
+            answer=answer
         )
-    
-    else:
-        # Step 2b: Execute SQL (routing["type"] == "sql")
-        failed_sql = None
-        try:
-            sql = routing["sql"]
-            failed_sql = sql
-            
-            # Validate SQL before execution
-            try:
-                validate_sql(sql)
-            except ValueError as ve:
-                raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
-            
-            rows, cols = run_query(sql, limit=500)
-            answer = result_to_text(req.question, cols, rows, len(rows))
-            
-            return AskResponse(
-                question=req.question,
-                sql=sql,
-                answer=answer,
-                columns=cols,
-                rows=rows,
-                row_count=len(rows),
-            )
-        
-        except HTTPException:
-            raise
-        except Exception as e1:
-            # 1 repair attempt: include the error message and regenerate
-            try:
-                from app.llm import improve_repair_question
-                repair_question = improve_repair_question(req.question, str(e1), failed_sql)
-                
-                # Try routing again with repair question
-                repair_routing = route_question(schema, repair_question)
-                
-                if repair_routing["type"] != "sql":
-                    raise HTTPException(
-                        status_code=400, 
-                        detail=f"Repair attempt resulted in non-SQL response. Original error: {str(e1)}"
-                    )
-                
-                sql = repair_routing["sql"]
-                
-                # Validate SQL before execution
-                try:
-                    validate_sql(sql)
-                except ValueError as ve:
-                    raise HTTPException(status_code=400, detail=f"SQL validation failed: {str(ve)}")
-                
-                rows, cols = run_query(sql, limit=500)
-                answer = result_to_text(req.question, cols, rows, len(rows))
-                
-                return AskResponse(
-                    question=req.question,
-                    sql=sql,
-                    answer=answer,
-                    columns=cols,
-                    rows=rows,
-                    row_count=len(rows),
-                )
-            except HTTPException:
-                raise
-            except Exception as e2:
-                raise HTTPException(status_code=400, detail=f"Ask failed: {str(e2)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LangChain ask failed: {str(e)}")
+
+@app.post("/ask-langchain/clear-memory")
+def clear_langchain_memory() -> Dict[str, str]:
+    """Clear the conversation memory for LangChain agent"""
+    try:
+        clear_memory()
+        return {"status": "success", "message": "Memory cleared"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to clear memory: {str(e)}")
 
 @app.post("/clv", response_model=CLVResponse)
 def clv(req: CLVRequest) -> CLVResponse:

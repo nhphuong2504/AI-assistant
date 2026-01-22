@@ -45,7 +45,7 @@ def ensure_limit(sql: str, limit: int) -> str:
     return f"{sql.rstrip()}\nLIMIT {int(limit)}"
 
 
-def run_query(sql: str, limit: int = 500, max_rows: int = 5000) -> Tuple[List[Dict[str, Any]], List[str]]:
+def run_query(sql: str, limit: int = 1000, max_rows: int = 10000) -> Tuple[List[Dict[str, Any]], List[str]]:
     sql = ensure_select_only(sql)
     sql = ensure_limit(sql, limit)
 

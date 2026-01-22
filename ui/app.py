@@ -9,7 +9,7 @@ API_URL = st.sidebar.text_input("API URL", "http://127.0.0.1:8000")
 st.title("Retail Data Assistant — SQL Playground")
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Schema", "SQL", "Ask", "CLV", "Survival"]
+    ["Schema", "SQL", "Ask (LangChain)", "CLV", "Survival"]
 )
 
 
@@ -49,27 +49,83 @@ LIMIT 20
             st.dataframe(df, use_container_width=True)
 
 with tab3:
-    st.subheader("Ask a question (Text-to-SQL)")
+    st.subheader("Ask a question (LangChain Agent)")
+    st.caption("Uses LangChain for multi-step reasoning and conversation memory. Supports complex queries that may require multiple tools.")
 
-    q = st.text_input("Question", "Revenue by month in 2011")
-    if st.button("Ask"):
-        r = requests.post(f"{API_URL}/ask", json={"question": q}, timeout=90)
-        if r.status_code != 200:
-            st.error(r.text)
+    # Memory settings
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        use_memory = st.checkbox("Use conversation memory", value=True, 
+                                help="Enable to remember context across questions")
+    with col2:
+        if st.button("Clear Memory"):
+            try:
+                r = requests.post(f"{API_URL}/ask-langchain/clear-memory", timeout=10)
+                if r.status_code == 200:
+                    st.success("Memory cleared!")
+                else:
+                    st.error(f"Failed to clear memory: {r.text}")
+            except Exception as e:
+                st.error(f"Error clearing memory: {str(e)}")
+
+    # Conversation history (if using memory)
+    if 'langchain_history' not in st.session_state:
+        st.session_state.langchain_history = []
+
+    # Display conversation history
+    if st.session_state.langchain_history and use_memory:
+        with st.expander("Conversation History", expanded=False):
+            for i, (q, a) in enumerate(st.session_state.langchain_history):
+                st.markdown(f"**Q{i+1}:** {q}")
+                st.markdown(f"**A{i+1}:** {a}")
+                st.divider()
+
+    # Question input
+    q = st.text_input("Question", 
+                     placeholder="e.g., 'What are the high-risk customers?' or 'Show me churn probability for top 5 high-risk customers'",
+                     key="langchain_question")
+    
+    if st.button("Ask (LangChain)", type="primary"):
+        if not q:
+            st.warning("Please enter a question")
         else:
-            payload = r.json()
-            
-            st.markdown("### Answer")
-            st.markdown(payload["answer"])
-
-            df = pd.DataFrame(payload["rows"])
-            with st.expander("View Generated SQL"):
-                st.code(payload["sql"], language="sql")
-            
-            if len(df) > 0:
-                with st.expander("View Raw Data"):
-                    st.write(f"Rows returned: {payload['row_count']}")
-                    st.dataframe(df, use_container_width=True)
+            with st.spinner("Processing with LangChain agent..."):
+                try:
+                    r = requests.post(
+                        f"{API_URL}/ask-langchain", 
+                        json={"question": q, "use_memory": use_memory}, 
+                        timeout=300
+                    )
+                    if r.status_code != 200:
+                        st.error(f"Error: {r.text}")
+                    else:
+                        payload = r.json()
+                        
+                        # Add to conversation history
+                        if use_memory:
+                            st.session_state.langchain_history.append((q, payload["answer"]))
+                        
+                        st.markdown("### Answer")
+                        st.markdown(payload["answer"])
+                        
+                        # Show info about LangChain capabilities
+                        with st.expander("ℹ️ About LangChain Mode"):
+                            st.markdown("""
+                            **LangChain Agent Features:**
+                            - **Multi-step reasoning**: Can chain multiple tools together
+                            - **Conversation memory**: Remembers context across questions
+                            - **Natural language**: Returns conversational answers
+                            - **Automatic tool selection**: Agent chooses the best tools
+                            
+                            **Example complex queries:**
+                            - "Show me the churn probability for the top 5 high-risk customers"
+                            - "What's the expected lifetime of customers in the High risk segment?"
+                            - "Compare churn probabilities between UK and non-UK customers"
+                            """)
+                except requests.exceptions.Timeout:
+                    st.error("Request timed out. The query may be too complex or the server is busy.")
+                except Exception as e:
+                    st.error(f"Error: {str(e)}")
 
 with tab4:
     st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
