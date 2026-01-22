@@ -104,3 +104,7 @@ Q: Given that the customer has survived (not churned) up to today, what is the p
 
 Compute conditional churn probability using
 1 − S(t0+X|x) / S(t0|x) for active customers only, where t0 is tenure at cutoff and S(t|x) comes from predict_survival_function.
+
+CLV for ranking - good
+Top k highest risk or with bucket (high - medium - low)
+Probability will churn in the next X days

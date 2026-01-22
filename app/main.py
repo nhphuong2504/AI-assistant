@@ -345,11 +345,17 @@ def ask(req: AskRequest) -> AskResponse:
         )
         
         # Convert analytics result to natural language answer
+        # For analytics, calculate stats on all rows but limit what we send to LLM
+        # Use segment-aware logic for customer_segmentation
+        is_segmentation = routing["function_name"] == "customer_segmentation"
         answer = result_to_text(
             req.question,
             result["columns"],
             result["rows"],
-            result["row_count"]
+            result["row_count"],
+            large_result_threshold=150,  # Keep low to trigger summary mode for large datasets
+            max_rows_for_llm=100,  # Never send more than 100 rows to LLM
+            is_segmentation=is_segmentation
         )
         
         return AskResponse(

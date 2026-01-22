@@ -386,6 +386,167 @@ Be specific with numbers, dates, and key findings. If the results are empty, exp
 Do not just summarize the query - explain what the actual data shows."""
 
 
+def extract_customer_ids_from_question(question: str) -> List[str]:
+    """
+    Extract customer IDs from a question using pattern matching.
+    
+    Args:
+        question: The user question
+        
+    Returns:
+        List of customer IDs found in the question (as strings)
+    """
+    customer_ids = []
+    
+    # Patterns to match customer IDs in various formats
+    # Order matters - more specific patterns first
+    patterns = [
+        r'\bcustomer\s+(?:id\s+)?(?:is\s+)?(?:#)?(\d+)',  # "customer 12345", "customer id 12345", "customer 14646"
+        r'\bcustomer\s+(?:#)?(\d+)',  # "customer #12345"
+        r'\bcust\s+(?:#)?(\d+)',  # "cust 12345"
+        r'\bid\s+(?:is\s+)?(?:#)?(\d+)',  # "id 12345", "id is 12345"
+        r'customer\s+(?:with\s+)?id\s+(?:of\s+)?(?:#)?(\d+)',  # "customer with id 12345"
+        r'for\s+customer\s+(?:#)?(\d+)',  # "for customer 12345"
+        r'customer\s+(?:#)?(\d+)\'?s',  # "customer 12345's"
+        r'customer\s+(?:#)?(\d+)\s+(?:has|have|is|was|in)',  # "customer 12345 has", "customer 14646 in"
+    ]
+    
+    # Try each pattern
+    for pattern in patterns:
+        matches = re.findall(pattern, question, re.IGNORECASE)
+        customer_ids.extend(matches)
+    
+    # Also look for multiple customer IDs (comma-separated, "and", etc.)
+    # Pattern: "customers 12345, 67890" or "customers 12345 and 67890"
+    multi_patterns = [
+        r'customers?\s+(?:#)?(\d+)(?:\s*[,and]+\s*(?:#)?(\d+))+',  # "customers 12345, 67890"
+        r'customer\s+(?:#)?(\d+)\s+and\s+(?:#)?(\d+)',  # "customer 12345 and 67890"
+        r'customers?\s+(?:#)?(\d+)\s*,\s*(?:#)?(\d+)',  # "customers 12345, 67890"
+    ]
+    
+    for pattern in multi_patterns:
+        matches = re.findall(pattern, question, re.IGNORECASE)
+        for match in matches:
+            if isinstance(match, tuple):
+                customer_ids.extend([m for m in match if m])
+            else:
+                customer_ids.append(match)
+    
+    # Also try to extract numbers that appear after customer-related keywords
+    # This catches cases like "what is customer 12345's CLV"
+    context_patterns = [
+        r'(?:customer|cust|id)\s+(?:#)?(\d+)',  # General pattern
+    ]
+    
+    for pattern in context_patterns:
+        matches = re.findall(pattern, question, re.IGNORECASE)
+        customer_ids.extend(matches)
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_ids = []
+    for cid in customer_ids:
+        cid_clean = cid.strip()
+        if cid_clean and cid_clean not in seen:
+            seen.add(cid_clean)
+            unique_ids.append(cid_clean)
+    
+    return unique_ids
+
+
+def detect_customer_lookup_question(question: str, columns: List[str]) -> bool:
+    """
+    Detect if the question is asking about specific customer(s).
+    
+    Args:
+        question: The user question
+        columns: List of column names in the results
+        
+    Returns:
+        True if question appears to be a customer lookup, False otherwise
+    """
+    if "customer_id" not in columns:
+        return False
+    
+    question_lower = question.lower()
+    
+    # Keywords that suggest customer-specific lookup
+    customer_lookup_keywords = [
+        "customer",
+        "cust",
+        "for customer",
+        "what is",
+        "show me",
+        "tell me about",
+        "details for",
+        "information about",
+    ]
+    
+    # Check if question contains customer lookup keywords
+    has_keyword = any(keyword in question_lower for keyword in customer_lookup_keywords)
+    
+    # Check if question contains customer ID patterns
+    customer_ids = extract_customer_ids_from_question(question)
+    has_customer_id = len(customer_ids) > 0
+    
+    # Also check for questions like "what is the CLV of customer X"
+    has_specific_metric = any(metric in question_lower for metric in [
+        "clv", "lifetime value", "churn risk", "churn probability", 
+        "segment", "lifetime", "risk score"
+    ])
+    
+    # Question is a customer lookup if:
+    # 1. Has customer ID(s) explicitly mentioned, OR
+    # 2. Has customer keyword + specific metric (e.g., "what is the CLV of customer 12345")
+    return (has_customer_id) or (has_keyword and has_specific_metric and "customer" in question_lower)
+
+
+def filter_rows_by_customer_ids(rows: List[Dict[str, Any]], customer_ids: List[str], customer_id_column: str = "customer_id") -> List[Dict[str, Any]]:
+    """
+    Filter rows to only include those matching the specified customer IDs.
+    
+    Args:
+        rows: List of row dictionaries
+        customer_ids: List of customer IDs to filter for (as strings)
+        customer_id_column: Name of the customer ID column
+        
+    Returns:
+        Filtered list of rows
+    """
+    if not customer_ids:
+        return rows
+    
+    # Convert customer_ids to appropriate types (handle both string and numeric IDs)
+    filtered_rows = []
+    # Normalize customer IDs from question (remove leading zeros, handle as strings)
+    normalized_customer_ids = {str(int(cid)) if cid.isdigit() else str(cid).strip() for cid in customer_ids}
+    
+    for row in rows:
+        row_customer_id = row.get(customer_id_column)
+        if row_customer_id is None:
+            continue
+        
+        # Convert row customer ID to normalized string format
+        # Handle both string and numeric types, remove leading zeros
+        try:
+            if isinstance(row_customer_id, (int, float)):
+                row_id_normalized = str(int(row_customer_id))
+            else:
+                # Try to parse as number first, then use as string
+                try:
+                    row_id_normalized = str(int(float(str(row_customer_id).strip())))
+                except (ValueError, TypeError):
+                    row_id_normalized = str(row_customer_id).strip()
+        except (ValueError, TypeError):
+            row_id_normalized = str(row_customer_id).strip()
+        
+        # Check if normalized IDs match
+        if row_id_normalized in normalized_customer_ids:
+            filtered_rows.append(row)
+    
+    return filtered_rows
+
+
 def result_to_text(
     question: str, 
     columns: List[str], 
@@ -393,11 +554,14 @@ def result_to_text(
     row_count: int,
     max_retries: int = 3,
     retry_delay: float = 1.0,
-    large_result_threshold: int = 100
+    large_result_threshold: int = 100,
+    max_rows_for_llm: int = 100,
+    is_segmentation: bool = False
 ) -> str:
     """
     Convert SQL query results into natural language text with resilience.
     Handles large result sets by providing statistical summaries.
+    Automatically detects and filters for customer-specific lookups.
     
     Args:
         question: The original user question
@@ -407,25 +571,166 @@ def result_to_text(
         max_retries: Maximum number of retry attempts
         retry_delay: Delay between retries in seconds
         large_result_threshold: Threshold for considering results "large"
+        max_rows_for_llm: Maximum number of rows to include in LLM prompt
+        is_segmentation: If True, provide segment-aware summaries
         
     Returns:
         Natural language explanation of the results
     """
+    # Step 1: Detect if this is a customer lookup question and filter rows
+    original_row_count = row_count
+    filtered_rows = rows
+    is_customer_lookup = False
+    customer_ids_found = []
+    
+    if detect_customer_lookup_question(question, columns):
+        customer_ids_found = extract_customer_ids_from_question(question)
+        if customer_ids_found:
+            is_customer_lookup = True
+            filtered_rows = filter_rows_by_customer_ids(rows, customer_ids_found)
+            
+            # If no matching customers found, provide helpful message with context
+            if not filtered_rows:
+                # Check if we have any rows at all (to provide better context)
+                if original_row_count == 0:
+                    return f"No data found for customer(s): {', '.join(customer_ids_found)}. The query returned no results."
+                
+                # Provide context about why customer might not be found
+                context_msg = f"No data found for customer(s): {', '.join(customer_ids_found)}."
+                
+                # Add helpful context based on the type of query
+                if is_segmentation:
+                    context_msg += " This customer may not be active at the cutoff date (2011-12-09) or may not meet the segmentation criteria. Segmentation only includes active customers."
+                else:
+                    context_msg += " Please verify the customer ID(s) are correct and that the customer exists in the dataset."
+                
+                # Show sample of available customer IDs to help user
+                if original_row_count > 0 and original_row_count <= 100:
+                    # If dataset is small, show available customer IDs
+                    available_ids = [str(row.get("customer_id", "")) for row in rows[:10] if row.get("customer_id") is not None]
+                    if available_ids:
+                        context_msg += f" Sample of available customer IDs: {', '.join(available_ids[:5])}..."
+                elif original_row_count > 0:
+                    # For large datasets, just mention the count
+                    context_msg += f" The dataset contains {original_row_count} customer records."
+                
+                return context_msg
+            
+            # Update row_count to reflect filtered results
+            row_count = len(filtered_rows)
+    
+    # Use filtered_rows for all subsequent processing
+    rows = filtered_rows
+    
+    # Add context about filtering if customer lookup was performed
+    filter_context = ""
+    if is_customer_lookup and customer_ids_found:
+        if len(customer_ids_found) == 1:
+            filter_context = f"\nNote: Results filtered for customer {customer_ids_found[0]} (showing {row_count} matching record(s) out of {original_row_count} total).\n"
+        else:
+            filter_context = f"\nNote: Results filtered for customers {', '.join(customer_ids_found)} (showing {row_count} matching record(s) out of {original_row_count} total).\n"
+    
     # Format the results for the LLM
     if row_count == 0:
         results_text = "The query returned no results (empty result set)."
-    elif row_count > large_result_threshold:
+    elif is_segmentation and "segment" in columns:
+        # Segment-aware logic for segmentation results
+        results_text = f"The segmentation analysis returned {row_count} customer(s).\n\n"
+        results_text += f"Columns: {', '.join(columns)}\n\n"
+        
+        # Group by segment
+        segment_groups = {}
+        for row in rows:
+            segment = row.get("segment", "Unknown")
+            if segment not in segment_groups:
+                segment_groups[segment] = []
+            segment_groups[segment].append(row)
+        
+        # Segment-level statistics
+        results_text += f"Segment Distribution ({len(segment_groups)} segments):\n"
+        segment_counts = {seg: len(segment_rows) for seg, segment_rows in segment_groups.items()}
+        for segment, count in sorted(segment_counts.items(), key=lambda x: x[1], reverse=True):
+            pct = (count / row_count) * 100
+            results_text += f"  {segment}: {count} customers ({pct:.1f}%)\n"
+        results_text += "\n"
+        
+        # Segment-level statistics for numeric columns
+        numeric_cols = [col for col in columns if col not in ["customer_id", "segment", "risk_label", "life_bucket", "action_tag", "recommended_action"]]
+        
+        if numeric_cols:
+            results_text += "Segment-level Statistics:\n"
+            for segment, segment_rows in sorted(segment_groups.items(), key=lambda x: len(x[1]), reverse=True):
+                results_text += f"\n  Segment: {segment} ({len(segment_rows)} customers)\n"
+                
+                for col in numeric_cols:
+                    try:
+                        values = [row.get(col) for row in segment_rows if row.get(col) is not None]
+                        if values:
+                            numeric_vals = []
+                            for v in values:
+                                try:
+                                    if isinstance(v, (int, float)):
+                                        numeric_vals.append(float(v))
+                                except (ValueError, AttributeError):
+                                    pass
+                            
+                            if numeric_vals:
+                                results_text += f"    {col}: min={min(numeric_vals):.2f}, max={max(numeric_vals):.2f}, mean={sum(numeric_vals)/len(numeric_vals):.2f}\n"
+                    except Exception:
+                        pass
+                
+                # Show segment characteristics
+                if "risk_label" in columns:
+                    risk_labels = [row.get("risk_label") for row in segment_rows if row.get("risk_label")]
+                    if risk_labels:
+                        risk_dist = {}
+                        for rl in risk_labels:
+                            risk_dist[rl] = risk_dist.get(rl, 0) + 1
+                        results_text += f"    Risk labels: {dict(risk_dist)}\n"
+                
+                if "life_bucket" in columns:
+                    life_buckets = [row.get("life_bucket") for row in segment_rows if row.get("life_bucket")]
+                    if life_buckets:
+                        life_dist = {}
+                        for lb in life_buckets:
+                            life_dist[lb] = life_dist.get(lb, 0) + 1
+                        results_text += f"    Life buckets: {dict(life_dist)}\n"
+                
+                if "recommended_action" in columns:
+                    actions = [row.get("recommended_action") for row in segment_rows if row.get("recommended_action")]
+                    if actions:
+                        unique_actions = list(set(actions))
+                        results_text += f"    Recommended actions: {', '.join(unique_actions[:3])}\n"
+        
+        results_text += f"\n\nTotal customers: {row_count}"
+        results_text += f"\nTotal segments: {len(segment_groups)}"
+        
+        # Show sample customers from top segments
+        results_text += f"\n\nSample customers (up to 5 per top segment):\n"
+        top_segments = sorted(segment_groups.items(), key=lambda x: len(x[1]), reverse=True)[:3]
+        sample_count = 0
+        for segment, segment_rows in top_segments:
+            if sample_count >= 15:  # Limit total samples
+                break
+            sample_rows = segment_rows[:5]
+            results_text += f"\n  {segment} segment ({len(segment_rows)} total):\n"
+            results_text += json.dumps(sample_rows, indent=4)
+            sample_count += len(sample_rows)
+    
+    elif row_count > large_result_threshold or row_count > max_rows_for_llm:
         # For large results, provide statistical summary instead of raw data
         results_text = f"The query returned {row_count} row(s).\n\n"
         results_text += f"Columns: {', '.join(columns)}\n\n"
         
-        # Calculate statistics for numeric columns
+        # Calculate statistics for numeric columns using ALL rows (not just sample)
         numeric_stats = {}
-        sample_rows = rows[:20]  # Sample for analysis
+        # Use all rows for statistics calculation, but limit sample for display
+        sample_rows = rows[:min(20, len(rows))]  # Sample for display
         
         for col in columns:
             try:
-                values = [row.get(col) for row in sample_rows if row.get(col) is not None]
+                # Calculate stats on ALL rows for accuracy
+                values = [row.get(col) for row in rows if row.get(col) is not None]
                 if values:
                     # Try to determine if numeric
                     numeric_vals = []
@@ -444,41 +749,50 @@ def result_to_text(
                             "min": min(numeric_vals),
                             "max": max(numeric_vals),
                             "mean": sum(numeric_vals) / len(numeric_vals),
-                            "sample_count": len(numeric_vals)
+                            "count": len(numeric_vals),
+                            "total": len(values)
                         }
             except Exception:
                 pass
         
         if numeric_stats:
-            results_text += "Statistical summary of numeric columns:\n"
+            results_text += "Statistical summary of numeric columns (calculated from all rows):\n"
             for col, stats in numeric_stats.items():
-                results_text += f"  {col}: min={stats['min']:.2f}, max={stats['max']:.2f}, mean={stats['mean']:.2f}\n"
+                results_text += f"  {col}: min={stats['min']:.2f}, max={stats['max']:.2f}, mean={stats['mean']:.2f}, count={stats['count']}\n"
             results_text += "\n"
         
-        # Show sample rows
-        results_text += f"Sample of first 20 rows (out of {row_count} total):\n"
-        results_text += json.dumps(sample_rows[:20], indent=2)
+        # Show sample rows (limited)
+        results_text += f"Sample of first {len(sample_rows)} rows (out of {row_count} total):\n"
+        results_text += json.dumps(sample_rows, indent=2)
         
         # Add summary statistics
         results_text += f"\n\nTotal rows: {row_count}"
         if numeric_stats:
             results_text += f"\nNumeric columns analyzed: {len(numeric_stats)}"
     else:
-        # For smaller results, show all data
-        results_text = f"The query returned {row_count} row(s).\n\n"
-        results_text += f"Columns: {', '.join(columns)}\n\n"
-        results_text += "Results:\n"
-        results_text += json.dumps(rows, indent=2)
+        # For smaller results, show all data (but still respect max_rows_for_llm)
+        if row_count <= max_rows_for_llm:
+            results_text = f"The query returned {row_count} row(s).\n\n"
+            results_text += f"Columns: {', '.join(columns)}\n\n"
+            results_text += "Results:\n"
+            results_text += json.dumps(rows, indent=2)
+        else:
+            # Even if under threshold, respect max_rows_for_llm
+            results_text = f"The query returned {row_count} row(s).\n\n"
+            results_text += f"Columns: {', '.join(columns)}\n\n"
+            results_text += f"Showing first {max_rows_for_llm} rows:\n"
+            results_text += json.dumps(rows[:max_rows_for_llm], indent=2)
     
     prompt = f"""USER QUESTION:
 {question}
-
+{filter_context}
 QUERY RESULTS:
 {results_text}
 
 Provide a natural language answer that directly addresses the user's question based on these results.
 Be specific with numbers, dates, and findings. If there are no results, explain that clearly.
 For large result sets, focus on key patterns, trends, and summary statistics rather than listing all individual rows.
+If the results were filtered for specific customer(s), make sure to mention that in your answer.
 """
     
     last_error = None
