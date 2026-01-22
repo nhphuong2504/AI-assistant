@@ -1,353 +1,549 @@
 import streamlit as st
 import pandas as pd
 import requests
+import os
+import time
 
-API_URL = st.sidebar.text_input("API URL", "http://127.0.0.1:8000")
-
-#streamlit run ui/app.py
-
-st.title("Retail Data Assistant — SQL Playground")
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs(
-    ["Schema", "SQL", "Ask (LangChain)", "CLV", "Survival"]
+# Configure page
+st.set_page_config(
+    page_title="Retail Data Assistant",
+    page_icon="💬",
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
+# Custom CSS for beautiful chatbot design
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    
+    /* Hide Streamlit default elements */
+    #MainMenu {visibility: hidden;}
+    footer {visibility: hidden;}
+    header {visibility: hidden;}
+    
+    /* Main container - centered and constrained */
+    .main {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        padding: 2rem 1rem;
+        min-height: 100vh;
+        background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+    }
+    
+    /* Chat container - centered card */
+    .chat-container {
+        max-width: 672px;
+        width: 100%;
+        height: calc(100vh - 4rem);
+        max-height: 800px;
+        display: flex;
+        flex-direction: column;
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+        border: 1px solid #e5e7eb;
+        overflow: hidden;
+    }
+    
+    /* Header section */
+    .chat-header {
+        flex-shrink: 0;
+        display: flex;
+        align-items: center;
+        padding: 1.25rem 1.5rem;
+        background: linear-gradient(135deg, #1e293b 0%, #334155 100%);
+        border-bottom: 1px solid #334155;
+    }
+    
+    .chat-header-avatar {
+        width: 40px;
+        height: 40px;
+        border-radius: 50%;
+        background: #3b82f6;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.25rem;
+        margin-right: 0.75rem;
+        flex-shrink: 0;
+    }
+    
+    .chat-header-text {
+        flex: 1;
+    }
+    
+    .chat-header-title {
+        font-family: 'Inter', sans-serif;
+        font-size: 1.125rem;
+        font-weight: 600;
+        color: white;
+        margin: 0;
+        line-height: 1.4;
+    }
+    
+    .chat-header-subtitle {
+        font-family: 'Inter', sans-serif;
+        font-size: 0.875rem;
+        color: rgba(255, 255, 255, 0.7);
+        margin: 0.25rem 0 0 0;
+        line-height: 1.4;
+    }
+    
+    /* Messages area - scrollable */
+    .chat-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 1.5rem;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+        background: #f9fafb;
+    }
+    
+    /* Message row */
+    .message-row {
+        display: flex;
+        align-items: flex-start;
+        gap: 0.75rem;
+        animation: fadeInUp 0.3s ease-out;
+    }
+    
+    .message-row.user {
+        flex-direction: row-reverse;
+    }
+    
+    @keyframes fadeInUp {
+        from {
+            opacity: 0;
+            transform: translateY(10px);
+        }
+        to {
+            opacity: 1;
+            transform: translateY(0);
+        }
+    }
+    
+    /* Avatar circle */
+    .message-avatar {
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1rem;
+        flex-shrink: 0;
+    }
+    
+    .message-avatar.user {
+        background: #3b82f6;
+    }
+    
+    .message-avatar.assistant {
+        background: #10b981;
+    }
+    
+    /* Message bubble */
+    .message-bubble {
+        max-width: 75%;
+        padding: 0.75rem 1rem;
+        border-radius: 12px;
+        font-family: 'Inter', sans-serif;
+        font-size: 14px;
+        line-height: 1.6;
+        word-wrap: break-word;
+        box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05);
+    }
+    
+    .message-bubble.user {
+        background: #1e293b;
+        color: white;
+        border-bottom-right-radius: 4px;
+    }
+    
+    .message-bubble.assistant {
+        background: white;
+        color: #1e293b;
+        border: 1px solid #e5e7eb;
+        border-bottom-left-radius: 4px;
+    }
+    
+    /* Typing indicator */
+    .typing-indicator {
+        display: flex;
+        align-items: center;
+        gap: 0.25rem;
+        padding: 0.75rem 1rem;
+    }
+    
+    .typing-dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: #9ca3af;
+        animation: typingBounce 1.4s infinite;
+    }
+    
+    .typing-dot:nth-child(2) {
+        animation-delay: 0.2s;
+    }
+    
+    .typing-dot:nth-child(3) {
+        animation-delay: 0.4s;
+    }
+    
+    @keyframes typingBounce {
+        0%, 60%, 100% {
+            transform: translateY(0);
+        }
+        30% {
+            transform: translateY(-10px);
+        }
+    }
+    
+    /* Input section */
+    .chat-input-section {
+        flex-shrink: 0;
+        padding: 1rem 1.5rem;
+        background: white;
+        border-top: 1px solid #e5e7eb;
+    }
+    
+    .input-wrapper {
+        position: relative;
+        display: flex;
+        align-items: flex-end;
+        gap: 0.5rem;
+    }
+    
+    .chat-textarea {
+        flex: 1;
+        min-height: 44px;
+        max-height: 120px;
+        padding: 0.75rem 3rem 0.75rem 1rem;
+        border: 1px solid #d1d5db;
+        border-radius: 12px;
+        font-family: 'Inter', sans-serif;
+        font-size: 14px;
+        line-height: 1.6;
+        resize: none;
+        overflow-y: auto;
+        background: #f9fafb;
+        transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    
+    .chat-textarea:focus {
+        outline: none;
+        border-color: #3b82f6;
+        box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.1);
+        background: white;
+    }
+    
+    .chat-textarea::placeholder {
+        color: #9ca3af;
+    }
+    
+    .send-button {
+        position: absolute;
+        right: 0.5rem;
+        bottom: 0.5rem;
+        width: 32px;
+        height: 32px;
+        border-radius: 50%;
+        background: #3b82f6;
+        border: none;
+        color: white;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        cursor: pointer;
+        transition: background-color 0.2s, transform 0.1s;
+        flex-shrink: 0;
+    }
+    
+    .send-button:hover:not(:disabled) {
+        background: #2563eb;
+        transform: scale(1.05);
+    }
+    
+    .send-button:disabled {
+        background: #d1d5db;
+        cursor: not-allowed;
+        opacity: 0.5;
+    }
+    
+    .send-button svg {
+        width: 16px;
+        height: 16px;
+    }
+    
+    /* Scrollbar styling */
+    .chat-messages::-webkit-scrollbar {
+        width: 6px;
+    }
+    
+    .chat-messages::-webkit-scrollbar-track {
+        background: transparent;
+    }
+    
+    .chat-messages::-webkit-scrollbar-thumb {
+        background: #d1d5db;
+        border-radius: 3px;
+    }
+    
+    .chat-messages::-webkit-scrollbar-thumb:hover {
+        background: #9ca3af;
+    }
+    
+    /* Sidebar styling */
+    .css-1d391kg {
+        padding-top: 3rem;
+    }
+    
+    /* Markdown content in messages */
+    .message-bubble p {
+        margin: 0.5rem 0;
+    }
+    
+    .message-bubble p:first-child {
+        margin-top: 0;
+    }
+    
+    .message-bubble p:last-child {
+        margin-bottom: 0;
+    }
+    
+    .message-bubble ul, .message-bubble ol {
+        margin: 0.5rem 0;
+        padding-left: 1.5rem;
+    }
+    
+    .message-bubble code {
+        background: rgba(0, 0, 0, 0.05);
+        padding: 0.125rem 0.25rem;
+        border-radius: 4px;
+        font-size: 0.875em;
+    }
+    
+    .message-bubble.user code {
+        background: rgba(255, 255, 255, 0.2);
+    }
+</style>
+""", unsafe_allow_html=True)
 
-with tab1:
-    st.subheader("Database schema")
-    if st.button("Load schema"):
-        r = requests.get(f"{API_URL}/schema", timeout=30)
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
-            schema = r.json()
-            st.json(schema)
+# Get API URL from environment or sidebar
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
-with tab2:
-    st.subheader("Run a safe SQL query")
-
-    sample = """SELECT
-  country,
-  COUNT(DISTINCT customer_id) AS customers,
-  SUM(revenue) AS revenue
-FROM transactions
-GROUP BY country
-ORDER BY revenue DESC
-LIMIT 20
-"""
-    sql = st.text_area("SQL (SELECT-only)", value=sample, height=200)
-    limit = st.slider("Default LIMIT (applied if query has none)", 1, 5000, 500)
-
-    if st.button("Run query"):
-        r = requests.post(f"{API_URL}/query", json={"sql": sql, "limit": limit}, timeout=60)
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
-            payload = r.json()
-            df = pd.DataFrame(payload["rows"])
-            st.write(f"Rows returned: {payload['row_count']}")
-            st.dataframe(df, use_container_width=True)
-
-with tab3:
-    st.subheader("Ask a question (LangChain Agent)")
-    st.caption("Uses LangChain for multi-step reasoning and conversation memory. Supports complex queries that may require multiple tools.")
-
+# Sidebar for settings
+with st.sidebar:
+    st.title("⚙️ Settings")
+    
+    # API URL input
+    api_url_input = st.text_input("API URL", value=API_URL, help="Backend API endpoint")
+    if api_url_input:
+        API_URL = api_url_input
+    
+    st.divider()
+    
     # Memory settings
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        use_memory = st.checkbox("Use conversation memory", value=True, 
-                                help="Enable to remember context across questions")
-    with col2:
-        if st.button("Clear Memory"):
-            try:
-                r = requests.post(f"{API_URL}/ask-langchain/clear-memory", timeout=10)
-                if r.status_code == 200:
-                    st.success("Memory cleared!")
-                else:
-                    st.error(f"Failed to clear memory: {r.text}")
-            except Exception as e:
-                st.error(f"Error clearing memory: {str(e)}")
-
-    # Conversation history (if using memory)
-    if 'langchain_history' not in st.session_state:
-        st.session_state.langchain_history = []
-
-    # Display conversation history
-    if st.session_state.langchain_history and use_memory:
-        with st.expander("Conversation History", expanded=False):
-            for i, (q, a) in enumerate(st.session_state.langchain_history):
-                st.markdown(f"**Q{i+1}:** {q}")
-                st.markdown(f"**A{i+1}:** {a}")
-                st.divider()
-
-    # Question input
-    q = st.text_input("Question", 
-                     placeholder="e.g., 'What are the high-risk customers?' or 'Show me churn probability for top 5 high-risk customers'",
-                     key="langchain_question")
+    use_memory = st.checkbox(
+        "💾 Use conversation memory", 
+        value=True,
+        help="Enable to remember context across questions"
+    )
     
-    if st.button("Ask (LangChain)", type="primary"):
-        if not q:
-            st.warning("Please enter a question")
-        else:
-            with st.spinner("Processing with LangChain agent..."):
-                try:
-                    r = requests.post(
-                        f"{API_URL}/ask-langchain", 
-                        json={"question": q, "use_memory": use_memory}, 
-                        timeout=300
-                    )
-                    if r.status_code != 200:
-                        st.error(f"Error: {r.text}")
-                    else:
-                        payload = r.json()
-                        
-                        # Add to conversation history
-                        if use_memory:
-                            st.session_state.langchain_history.append((q, payload["answer"]))
-                        
-                        st.markdown("### Answer")
-                        st.markdown(payload["answer"])
-                        
-                        # Show info about LangChain capabilities
-                        with st.expander("ℹ️ About LangChain Mode"):
-                            st.markdown("""
-                            **LangChain Agent Features:**
-                            - **Multi-step reasoning**: Can chain multiple tools together
-                            - **Conversation memory**: Remembers context across questions
-                            - **Natural language**: Returns conversational answers
-                            - **Automatic tool selection**: Agent chooses the best tools
-                            
-                            **Example complex queries:**
-                            - "Show me the churn probability for the top 5 high-risk customers"
-                            - "What's the expected lifetime of customers in the High risk segment?"
-                            - "Compare churn probabilities between UK and non-UK customers"
-                            """)
-                except requests.exceptions.Timeout:
-                    st.error("Request timed out. The query may be too complex or the server is busy.")
-                except Exception as e:
-                    st.error(f"Error: {str(e)}")
+    if st.button("🗑️ Clear Memory", use_container_width=True):
+        try:
+            r = requests.post(f"{API_URL}/ask-langchain/clear-memory", timeout=10)
+            if r.status_code == 200:
+                st.success("Memory cleared!")
+                # Clear local history too
+                if 'messages' in st.session_state:
+                    st.session_state.messages = []
+            else:
+                st.error(f"Failed: {r.text}")
+        except Exception as e:
+            st.error(f"Error: {str(e)}")
+    
+    st.divider()
+    
+    # Info section
+    with st.expander("ℹ️ About"):
+        st.markdown("""
+        **Retail Data Assistant**
+        
+        Powered by LangChain AI agent with:
+        - Multi-step reasoning
+        - Conversation memory
+        - Natural language understanding
+        
+        **Capabilities:**
+        - SQL queries on transaction data
+        - Customer Lifetime Value (CLV) predictions
+        - Churn risk scoring
+        - Churn probability predictions
+        - Expected remaining lifetime
+        - Customer segmentation
+        """)
 
-with tab4:
-    st.subheader("Customer Lifetime Value (BG/NBD + Gamma-Gamma)")
+# Initialize chat history
+if 'messages' not in st.session_state:
+    st.session_state.messages = []
 
-    cutoff = st.date_input("Cutoff date (calibration end)", value=pd.to_datetime("2011-12-09"))
-    horizon = st.slider("CLV horizon (days)", 30, 365, 90)
+if 'is_typing' not in st.session_state:
+    st.session_state.is_typing = False
 
-    if st.button("Run CLV"):
+# Chat container HTML structure
+st.markdown("""
+<div class="chat-container">
+    <div class="chat-header">
+        <div class="chat-header-avatar">🤖</div>
+        <div class="chat-header-text">
+            <div class="chat-header-title">Retail Data Assistant</div>
+            <div class="chat-header-subtitle">Ask me anything about your retail data</div>
+        </div>
+    </div>
+    <div class="chat-messages" id="messages-container">
+""", unsafe_allow_html=True)
+
+# Display chat history
+for message in st.session_state.messages:
+    role = message["role"]
+    content = message["content"]
+    
+    if role == "user":
+        st.markdown(f"""
+        <div class="message-row user">
+            <div class="message-avatar user">👤</div>
+            <div class="message-bubble user">{content}</div>
+        </div>
+        """, unsafe_allow_html=True)
+    else:
+        # Escape HTML in content but allow markdown-like formatting
+        import html
+        escaped_content = html.escape(content)
+        # Convert markdown-style formatting to HTML
+        import re
+        escaped_content = re.sub(r'\*\*(.*?)\*\*', r'<strong>\1</strong>', escaped_content)
+        escaped_content = re.sub(r'\*(.*?)\*', r'<em>\1</em>', escaped_content)
+        escaped_content = re.sub(r'`(.*?)`', r'<code>\1</code>', escaped_content)
+        # Convert line breaks
+        escaped_content = escaped_content.replace('\n', '<br>')
+        
+        st.markdown(f"""
+        <div class="message-row assistant">
+            <div class="message-avatar assistant">🤖</div>
+            <div class="message-bubble assistant">{escaped_content}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# Show typing indicator if processing
+if st.session_state.is_typing:
+    st.markdown("""
+    <div class="message-row assistant">
+        <div class="message-avatar assistant">🤖</div>
+        <div class="message-bubble assistant">
+            <div class="typing-indicator">
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+                <div class="typing-dot"></div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Close messages container
+st.markdown("</div>", unsafe_allow_html=True)
+
+# Input section
+st.markdown("""
+<div class="chat-input-section">
+    <div class="input-wrapper">
+""", unsafe_allow_html=True)
+
+# Use Streamlit's text_area for auto-resize, but style it
+user_input = st.text_area(
+    "",
+    key="chat_input",
+    placeholder="Type your message... (Press Enter to send, Shift+Enter for new line)",
+    height=44,
+    label_visibility="collapsed"
+)
+
+# Send button
+send_button = st.button("➤", key="send_button", help="Send message")
+
+st.markdown("</div></div></div>", unsafe_allow_html=True)
+
+# Handle user input
+if send_button and user_input and not st.session_state.is_typing:
+    # Add user message to history
+    st.session_state.messages.append({"role": "user", "content": user_input})
+    st.session_state.is_typing = True
+    st.rerun()
+
+# Process the latest user message if typing
+if st.session_state.is_typing and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+    user_question = st.session_state.messages[-1]["content"]
+    
+    try:
         r = requests.post(
-            f"{API_URL}/clv",
-            json={"cutoff_date": str(cutoff), "horizon_days": int(horizon)},
-            timeout=180,
+            f"{API_URL}/ask-langchain",
+            json={
+                "question": user_question,
+                "use_memory": use_memory,
+                "thread_id": "default"
+            },
+            timeout=300
         )
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
+        
+        if r.status_code == 200:
             payload = r.json()
-            st.json(payload["summary"])
-
-            df = pd.DataFrame(payload["top_customers"])
-            st.dataframe(df, use_container_width=True)
-
-with tab5:
-    st.subheader("Survival Analysis")
-    st.caption("Cutoff date is fixed at 2011-12-09 (inclusive). Inactivity days is fixed at 90 days.")
-
-    st.markdown("## Kaplan–Meier (All customers)")
-
-    if st.button("Run KM (All customers)"):
-        r = requests.post(
-            f"{API_URL}/survival/km?inactivity_days=90",
-            timeout=180,
-        )
-        if r.status_code != 200:
-            st.error(r.text)
+            answer = payload["answer"]
+            st.session_state.messages.append({"role": "assistant", "content": answer})
         else:
-            payload = r.json()
-            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
-            st.write(f"N customers: {payload['n_customers']} | Churn rate: {payload['churn_rate']:.3f}")
-
-            # Display survival curve data
-            plot_df = pd.DataFrame(payload["survival_curve"])
-            st.markdown("### Survival Curve Data")
-            st.dataframe(plot_df, use_container_width=True)
-
-    st.markdown("## Customer Risk Scoring (Cox Model)")
-
-    if st.button("Score Customers"):
-        with st.spinner("Fitting Cox model and scoring customers..."):
-            r = requests.post(
-                f"{API_URL}/survival/score?inactivity_days=90",
-                timeout=300,
-            )
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
-            payload = r.json()
-            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']}")
-            st.write(f"N customers: {payload['n_customers']}")
-
-            # Display summary
-            summary = payload['summary']
-            st.markdown("### Summary")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("Total Customers", summary['n_customers'])
-            with col2:
-                st.metric("Mean Risk Score", f"{summary['risk_score_mean']:.3f}")
-            with col3:
-                st.metric("Max Risk Score", f"{summary['risk_score_max']:.3f}")
-
-            # Risk bucket distribution
-            st.markdown("### Risk Bucket Distribution")
-            bucket_counts = summary['risk_bucket_counts']
-            bucket_df = pd.DataFrame({
-                'Risk Bucket': list(bucket_counts.keys()),
-                'Count': list(bucket_counts.values())
-            })
-            st.dataframe(bucket_df, use_container_width=True)
-
-            # Display scored customers
-            df = pd.DataFrame(payload['scored_customers'])
-            st.markdown("### Scored Customers")
-            st.dataframe(df, use_container_width=True)
-
-    st.markdown("## Churn Probability Prediction (Cox Model)")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        X_days = st.slider("Prediction horizon (days)", 7, 365, 90, help="Probability of churn in the next X days")
-    
-    if st.button("Predict Churn Probability"):
-        with st.spinner("Fitting Cox model and predicting churn probabilities..."):
-            r = requests.post(
-                f"{API_URL}/survival/churn-probability?inactivity_days=90&X_days={X_days}",
-                timeout=300,
-            )
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
-            payload = r.json()
-            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']} | Horizon: {payload['X_days']} days")
-            st.write(f"N active customers: {payload['n_customers']}")
-
-            # Display summary
-            summary = payload['summary']
-            st.markdown("### Summary")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Customers", summary['n_customers'])
-            with col2:
-                st.metric("Mean Churn Prob", f"{summary['churn_probability_mean']:.3f}")
-            with col3:
-                st.metric("Median Churn Prob", f"{summary['churn_probability_median']:.3f}")
-            with col4:
-                st.metric("Max Churn Prob", f"{summary['churn_probability_max']:.3f}")
-
-            # Display predictions
-            df = pd.DataFrame(payload['predictions'])
-            st.markdown("### Churn Probability Predictions")
-            st.dataframe(df, use_container_width=True)
-
-    st.markdown("## Expected Remaining Lifetime (Cox Model)")
-
-    col1 = st.columns(1)[0]
-    H_days = st.slider("Horizon (days)", 30, 1825, 365, help="Horizon for restricted expected remaining lifetime")
-    
-    if st.button("Compute Expected Lifetime"):
-        with st.spinner("Fitting Cox model and computing expected remaining lifetime..."):
-            r = requests.post(
-                f"{API_URL}/survival/expected-lifetime?inactivity_days=90&H_days={H_days}",
-                timeout=300,
-            )
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
-            payload = r.json()
-            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']} | Horizon: {payload['H_days']} days")
-            st.write(f"N active customers: {payload['n_customers']}")
-
-            # Display summary
-            summary = payload['summary']
-            st.markdown("### Summary")
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Total Customers", summary['n_customers'])
-            with col2:
-                st.metric("Mean Expected Lifetime", f"{summary['expected_lifetime_mean']:.2f} days")
-            with col3:
-                st.metric("Median Expected Lifetime", f"{summary['expected_lifetime_median']:.2f} days")
-            with col4:
-                st.metric("Max Expected Lifetime", f"{summary['expected_lifetime_max']:.2f} days")
-
-            # Display expected lifetimes
-            df = pd.DataFrame(payload['expected_lifetimes'])
-            st.markdown("### Expected Remaining Lifetime Predictions")
-            st.dataframe(df, use_container_width=True)
-
-    st.markdown("## Customer Segmentation (Risk × Expected Lifetime)")
-
-    if st.button("Build Segmentation Table"):
-        with st.spinner("Building segmentation table..."):
-            r = requests.post(
-                f"{API_URL}/survival/segmentation?inactivity_days=90&H_days=365",
-                timeout=300,
-            )
-        if r.status_code != 200:
-            st.error(r.text)
-        else:
-            payload = r.json()
-            st.write(f"Cutoff: {payload['cutoff_date']} | Inactivity days: {payload['inactivity_days']} | Horizon: {payload['H_days']} days")
-            st.write(f"N active customers: {payload['n_customers']}")
-
-            # Display cutoffs
-            cutoffs = payload['cutoffs']
-            st.markdown("### ERL Bucket Cutoffs")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("33rd Percentile (q33)", f"{cutoffs['q33']:.2f} days")
-            with col2:
-                st.metric("67th Percentile (q67)", f"{cutoffs['q67']:.2f} days")
-            with col3:
-                st.metric("Horizon (H_days)", f"{cutoffs['H_days']} days")
-
-            # Display summary
-            summary = payload['summary']
-            st.markdown("### Summary")
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Customers", summary['n_customers'])
-                st.metric("Mean ERL", f"{summary['erl_mean']:.2f} days")
-            with col2:
-                st.metric("Median ERL", f"{summary['erl_median']:.2f} days")
-
-            # Segment distribution
-            st.markdown("### Segment Distribution")
-            df = pd.DataFrame(payload['segments'])
+            error_msg = f"❌ Error: {r.text}"
+            st.session_state.messages.append({"role": "assistant", "content": error_msg})
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("**By Segment:**")
-                segment_counts = pd.Series(summary['segment_counts']).sort_index()
-                st.dataframe(segment_counts.reset_index().rename(columns={'index': 'Segment', 0: 'Count'}), use_container_width=True, hide_index=True)
-            
-            with col2:
-                st.markdown("**By Action Tag:**")
-                action_counts = pd.Series(summary['action_tag_counts']).sort_index()
-                st.dataframe(action_counts.reset_index().rename(columns={'index': 'Action Tag', 0: 'Count'}), use_container_width=True, hide_index=True)
+    except requests.exceptions.Timeout:
+        error_msg = "⏱️ Request timed out. The query may be too complex. Please try again or simplify your question."
+        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+    except Exception as e:
+        error_msg = f"❌ Error: {str(e)}"
+        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+    
+    st.session_state.is_typing = False
+    st.rerun()
 
-            # Display full segmentation table
-            st.markdown("### Full Segmentation Table")
-            st.dataframe(df, use_container_width=True)
-
-            # Filter by segment
-            if len(df) > 0:
-                st.markdown("### Filter by Segment")
-                selected_segment = st.selectbox("Select segment to view details", 
-                                              options=sorted(df['segment'].unique()))
-                segment_df = df[df['segment'] == selected_segment]
-                st.write(f"**{len(segment_df)} customers in {selected_segment} segment**")
-                st.dataframe(segment_df[['customer_id', 'risk_label', 't0', 'erl_365_days', 
-                                       'life_bucket', 'action_tag', 'recommended_action']], 
-                           use_container_width=True)
-
-
+# JavaScript for auto-scroll and Enter key handling
+st.markdown("""
+<script>
+    // Auto-scroll to bottom when new messages appear
+    function scrollToBottom() {
+        const container = document.getElementById('messages-container');
+        if (container) {
+            container.scrollTop = container.scrollHeight;
+        }
+    }
+    
+    // Scroll on load and when messages update
+    window.addEventListener('load', scrollToBottom);
+    setTimeout(scrollToBottom, 100);
+    
+    // Handle Enter key in textarea
+    const textarea = document.querySelector('textarea[data-testid*="stTextArea"]');
+    if (textarea) {
+        textarea.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                const sendButton = document.querySelector('button[data-testid*="baseButton-secondary"]');
+                if (sendButton && !sendButton.disabled) {
+                    sendButton.click();
+                }
+            }
+        });
+    }
+</script>
+""", unsafe_allow_html=True)
