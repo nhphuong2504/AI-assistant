@@ -2,7 +2,7 @@ import streamlit as st
 import requests
 import os
 
-# Configure page
+# --- 1. CONFIGURATION ---
 st.set_page_config(
     page_title="Retail Data Assistant",
     page_icon="💬",
@@ -10,7 +10,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- THEME / CSS (match screenshot) ---
+# --- 2. THEME / CSS ---
 st.markdown(
     """
 <style>
@@ -45,7 +45,7 @@ st.markdown(
   display:flex; align-items:center; justify-content:center;
   font-weight: 700; font-size: 18px;
 }
-.h-title { font-size: 22px; font-weight: 700; line-height: 1.1; margin:0; }
+.h-title { font-size: 22px; font-weight: 700; line-height: 1.1; margin:0; color: #000000; }
 .h-sub   { font-size: 14px; color:#6b7280; margin:2px 0 0 0; }
 
 /* Chat rows */
@@ -60,7 +60,8 @@ st.markdown(
   border: 1px solid #e6e8eb;
   flex: 0 0 auto;
 }
-.bot svg { width: 18px; height: 18px; opacity: .75; }
+.bot svg { width: 18px; height: 18px; opacity: 1; }
+.bot svg path, .bot svg rect { stroke: #4b5563; }
 
 .userCircle {
   width: 46px; height: 46px; border-radius: 50%;
@@ -94,71 +95,190 @@ st.markdown(
   border-top-right-radius: 10px;
 }
 
-/* Bottom input bar */
+/* --- FIXED BOTTOM BAR STYLING --- */
+/* This creates the white background bar fixed at bottom */
 .input-wrap {
   position: fixed;
   left: 0; right: 0; bottom: 0;
   background: #f6f7f9;
   border-top: 1px solid #e9ecef;
-  padding: 14px 0;
+  padding: 20px 0; /* Increased padding */
   z-index: 999;
+  height: 80px; /* Fixed height to cover bottom area */
+  pointer-events: none; /* Let clicks pass through to the widgets */
 }
-.input-inner {
-  max-width: 1200px;
-  margin: 0 auto;
-  padding: 0 1.2rem;
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-.stTextInput > div > div > input {
-  height: 48px;
-  border-radius: 18px !important;
-  border: 1px solid #e5e7eb !important;
-  background: #ffffff !important;
-  padding-left: 14px !important;
-}
-.sendBtn button {
-  width: 52px !important;
-  height: 52px !important;
-  border-radius: 50% !important;
-  border: none !important;
-  background: #9bd7d4 !important;
-  color: #ffffff !important;
-}
-.sendBtn button:hover { filter: brightness(0.98); }
-.sendBtn button:active { transform: translateY(1px); }
 
-/* Make markdown blocks not add extra top/bottom spacing */
-.chat-area .stMarkdown { margin: 0; }
+/* --- WIDGET STYLING --- */
+/* --- WIDGET STYLING --- */
+
+/* 1. Reset the outermost container (Streamlit wrapper) */
+/* This is often where the 'black corners' hide */
+[data-testid="stTextInput"] {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+}
+
+/* 2. Reset the BaseWeb container (The immediate parent of the input) */
+div[data-baseweb="input"] {
+    background-color: transparent !important;
+    border: none !important; 
+    border-radius: 24px !important; /* Match your desired radius */
+    box-shadow: none !important;
+}
+
+/* 3. Style the Actual Input Field */
+/* We apply the border and background HERE only */
+.stTextInput input {
+    height: 48px;
+    border-radius: 24px !important;
+    border: 1px solid #e5e7eb !important; /* Light gray border */
+    background: #ffffff !important;        /* Pure white background */
+    padding-left: 20px !important;
+    color: #000000 !important;
+    caret-color: #000000 !important;
+}
+
+/* 4. Handle Focus State */
+/* When clicking inside, change the border color of the input itself */
+.stTextInput input:focus {
+    border: 1px solid #0ea5a4 !important; /* Teal focus border */
+    outline: none !important;
+}
+
+/* 5. Placeholder Styling */
+.stTextInput input::placeholder {
+    color: #6b7280 !important;
+    opacity: 1 !important;
+}
+
+
+
+/* Force standard columns to align content vertically */
+[data-testid="column"] {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+}
+
+/* Target the Send Button specifically in the layout */
+/* We assume it's the button in the narrow column */
+[data-testid="column"] .stButton button,
+[data-testid="column"] .stButton > button,
+button[data-testid="baseButton-secondary"],
+.stButton button[kind="secondary"],
+div[data-testid="column"]:nth-child(2) button {
+    width: 48px !important;
+    height: 48px !important;
+    border-radius: 50% !important;
+    background-color: #0ea5a4 !important;
+    background: #0ea5a4 !important;
+    color: white !important;
+    border: none !important;
+    padding: 0 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-shadow: none !important;
+}
+[data-testid="column"] .stButton button:hover,
+[data-testid="column"] .stButton > button:hover,
+button[data-testid="baseButton-secondary"]:hover,
+.stButton button[kind="secondary"]:hover,
+div[data-testid="column"]:nth-child(2) button:hover {
+    background-color: #0c8d8c !important;
+    background: #0c8d8c !important;
+    color: white !important;
+}
+[data-testid="column"] .stButton button:active,
+[data-testid="column"] .stButton > button:active,
+button[data-testid="baseButton-secondary"]:active,
+.stButton button[kind="secondary"]:active,
+div[data-testid="column"]:nth-child(2) button:active {
+    transform: translateY(1px);
+    background-color: #0ea5a4 !important;
+    background: #0ea5a4 !important;
+    color: white !important;
+}
+[data-testid="column"] .stButton button:focus,
+[data-testid="column"] .stButton > button:focus,
+button[data-testid="baseButton-secondary"]:focus,
+.stButton button[kind="secondary"]:focus,
+div[data-testid="column"]:nth-child(2) button:focus {
+    background-color: #0ea5a4 !important;
+    background: #0ea5a4 !important;
+    color: white !important;
+}
+
+/* Hide the default Streamlit labels and spacing */
+.stTextInput {
+    margin-bottom: 0 !important;
+}
+.stButton {
+    margin-bottom: 0 !important;
+}
 
 /* Typing indicator */
 .typing-indicator {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-  margin: 16px 0;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin: 16px 0;
+}
+
+/* Thinking animation */
+.thinking-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.thinking-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background-color: #6b7280;
+    animation: thinking-pulse 1.4s ease-in-out infinite;
+}
+
+.thinking-dot:nth-child(1) {
+    animation-delay: 0s;
+}
+
+.thinking-dot:nth-child(2) {
+    animation-delay: 0.2s;
+}
+
+.thinking-dot:nth-child(3) {
+    animation-delay: 0.4s;
+}
+
+@keyframes thinking-pulse {
+    0%, 60%, 100% {
+        opacity: 0.3;
+        transform: scale(0.8);
+    }
+    30% {
+        opacity: 1;
+        transform: scale(1);
+    }
 }
 </style>
 """,
     unsafe_allow_html=True,
 )
 
-# Get API URL from environment or sidebar
+# --- 3. SETTINGS & SIDEBAR ---
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000")
 
-# Sidebar for settings
 with st.sidebar:
     st.title("⚙️ Settings")
-    
-    # API URL input
     api_url_input = st.text_input("API URL", value=API_URL, help="Backend API endpoint")
     if api_url_input:
         API_URL = api_url_input
     
     st.divider()
     
-    # Memory settings
     use_memory = st.checkbox(
         "💾 Use conversation memory", 
         value=True,
@@ -178,33 +298,16 @@ with st.sidebar:
             st.error(f"Error: {str(e)}")
     
     st.divider()
-    
-    # Info section
     with st.expander("ℹ️ About"):
-        st.markdown("""
-        **Retail Data Assistant**
-        
-        Powered by LangChain AI agent with:
-        - Multi-step reasoning
-        - Conversation memory
-        - Natural language understanding
-        
-        **Capabilities:**
-        - SQL queries on transaction data
-        - Customer Lifetime Value (CLV) predictions
-        - Churn risk scoring
-        - Churn probability predictions
-        - Expected remaining lifetime
-        - Customer segmentation
-        """)
+        st.markdown("**Retail Data Assistant**\n\nPowered by LangChain AI agent.")
 
-# --- HEADER ---
+# --- 4. HEADER ---
 st.markdown(
     """
 <div class="chat-header">
-  <div class="logo">RD</div>
+  <div class="logo">AI</div>
   <div>
-    <p class="h-title">Retail Data Assistant</p>
+    <p class="h-title"> Online-Retail Data Assistant</p>
     <p class="h-sub">Always here to help with your retail data</p>
   </div>
 </div>
@@ -212,7 +315,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- STATE ---
+# --- 5. STATE MANAGEMENT ---
 if 'messages' not in st.session_state:
     st.session_state.messages = [
         {
@@ -221,129 +324,85 @@ if 'messages' not in st.session_state:
         }
     ]
 
-# SVG Icons
-BOT_SVG = """
-<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-  <path d="M12 2v2"/>
-  <path d="M8 4h8"/>
-  <rect x="6" y="7" width="12" height="12" rx="3"/>
-  <path d="M9 12h.01M15 12h.01"/>
-  <path d="M9 16h6"/>
-</svg>
-"""
-USER_SVG = """
-<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8">
-  <path d="M20 21a8 8 0 10-16 0"/>
-  <circle cx="12" cy="8" r="3"/>
-</svg>
-"""
+if "input_counter" not in st.session_state:
+    st.session_state.input_counter = 0
 
-# --- RENDER CHAT ---
+# --- 6. CALLBACK FUNCTION (CORE LOGIC) ---
+def handle_input():
+    """Handles user input from both 'Enter' key and Button click."""
+    widget_key = f"prompt_text_{st.session_state.input_counter}"
+    user_input = st.session_state.get(widget_key, "").strip()
+    
+    if user_input:
+        st.session_state.messages.append({"role": "user", "content": user_input})
+        st.session_state.is_typing = True
+        st.session_state.input_counter += 1
+
+# --- 7. RENDER CHAT HISTORY ---
+BOT_SVG = """<svg viewBox="0 0 24 24" fill="none" stroke="#4b5563" stroke-width="1.8"><path d="M12 2v2"/><path d="M8 4h8"/><rect x="6" y="7" width="12" height="12" rx="3"/><path d="M9 12h.01M15 12h.01"/><path d="M9 16h6"/></svg>"""
+USER_SVG = """<svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="1.8"><path d="M20 21a8 8 0 10-16 0"/><circle cx="12" cy="8" r="3"/></svg>"""
+
 st.markdown('<div class="chat-area">', unsafe_allow_html=True)
 
 for m in st.session_state.messages:
     role = m["role"]
-    # Escape HTML but preserve newlines
     content = m["content"] or ""
     text = content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br>")
 
     if role == "assistant":
-        st.markdown(
-            f"""
-<div class="row assistant">
-  <div class="bot">{BOT_SVG}</div>
-  <div class="bubble assistant">{text}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"""<div class="row assistant"><div class="bot">{BOT_SVG}</div><div class="bubble assistant">{text}</div></div>""", unsafe_allow_html=True)
     else:
-        # user: show message bubble, then circle with first letter, then profile icon
         first_letter = (content.strip()[:1] or "U").upper()
-        st.markdown(
-            f"""
-<div class="row user">
-  <div class="bubble user">{text}</div>
-  <div class="userCircle">{first_letter}</div>
-  <div class="userIcon">{USER_SVG}</div>
-</div>
-""",
-            unsafe_allow_html=True,
-        )
+        st.markdown(f"""<div class="row user"><div class="bubble user">{text}</div><div class="userIcon">{USER_SVG}</div></div>""", unsafe_allow_html=True)
 
-# Show typing indicator if processing
 if st.session_state.get('is_typing', False):
-    st.markdown(
-        f"""
-<div class="row assistant">
-  <div class="bot">{BOT_SVG}</div>
-  <div class="bubble assistant">Thinking...</div>
-</div>
-""",
-        unsafe_allow_html=True,
-    )
+    thinking_html = """<div class="row assistant"><div class="bot">{}</div><div class="bubble assistant"><span class="thinking-dots"><span class="thinking-dot"></span><span class="thinking-dot"></span><span class="thinking-dot"></span></span></div></div>""".format(BOT_SVG)
+    st.markdown(thinking_html, unsafe_allow_html=True)
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# --- FIXED BOTTOM INPUT ---
-st.markdown('<div class="input-wrap"><div class="input-inner">', unsafe_allow_html=True)
+# --- 8. FIXED INPUT AREA (THE FIX) ---
+# We inject the background bar visually
+st.markdown('<div class="input-wrap"></div>', unsafe_allow_html=True)
 
-# Put the widgets in columns so they sit on one line
-c1, c2 = st.columns([12, 1.2], gap="small")
+# We use standard columns for the layout. 
+# vertical_alignment="center" is the KEY to fixing the offset.
+c1, c2 = st.columns([12, 1], gap="small", vertical_alignment="center")
+
 with c1:
-    prompt = st.text_input("",
-                           placeholder="Type a message...",
-                           label_visibility="collapsed",
-                           key="prompt_text")
+    st.text_input(
+        "",
+        placeholder="Type a message...",
+        label_visibility="collapsed",
+        key=f"prompt_text_{st.session_state.input_counter}",
+        on_change=handle_input
+    )
+
 with c2:
-    st.markdown('<div class="sendBtn">', unsafe_allow_html=True)
-    send = st.button("➤", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.button(
+        "➤", 
+        use_container_width=True, 
+        key=f"send_btn_{st.session_state.input_counter}",
+        on_click=handle_input
+    )
 
-st.markdown("</div></div>", unsafe_allow_html=True)
-
-# --- ACTION ---
-if send and prompt.strip():
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt.strip()})
-    
-    # Set typing state
-    st.session_state.is_typing = True
-    st.session_state.prompt_text = ""
-    st.rerun()
-
-# Handle API call after rerun (to show typing indicator first)
+# --- 9. HANDLE API RESPONSE ---
 if st.session_state.get('is_typing', False) and st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
-    # Get the last user message
     last_user_msg = st.session_state.messages[-1]["content"]
-    
-    # Make API request
     try:
         response = requests.post(
             f"{API_URL}/ask-langchain",
-            json={
-                "question": last_user_msg,
-                "use_memory": use_memory,
-                "thread_id": "default"
-            },
+            json={"question": last_user_msg, "use_memory": use_memory, "thread_id": "default"},
             timeout=300
         )
-        
         if response.status_code == 200:
             payload = response.json()
-            answer = payload["answer"]
+            answer = payload.get("answer", "No answer provided.")
             st.session_state.messages.append({"role": "assistant", "content": answer})
         else:
-            error_msg = f"❌ Error: {response.text}"
-            st.session_state.messages.append({"role": "assistant", "content": error_msg})
-            
-    except requests.exceptions.Timeout:
-        error_msg = "⏱️ Request timed out. The query may be too complex. Please try again or simplify your question."
-        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {response.text}"})
     except Exception as e:
-        error_msg = f"❌ Error: {str(e)}"
-        st.session_state.messages.append({"role": "assistant", "content": error_msg})
+        st.session_state.messages.append({"role": "assistant", "content": f"❌ Error: {str(e)}"})
     
-    # Clear typing state
     st.session_state.is_typing = False
     st.rerun()
